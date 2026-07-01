@@ -52,10 +52,8 @@ semver = "1.0"
 # Proof-of-Model: possession proof construction (borsh wire-format must match the node).
 borsh = { version = "1", features = ["derive"] }
 blake3 = "1"
-# Phase-3 OPoI: SLM inference via candle
-candle-core = { version = "0.9", features = ["cuda"] }
-candle-transformers = { version = "0.9", features = ["cuda"] }
-candle-nn = { version = "0.9", features = ["cuda"] }
+# Phase-3 OPoI: SLM inference via candle. The GPU backend is selected per target —
+# CUDA on Linux/Windows rigs, Metal on Apple Silicon — in the [target.*] sections below.
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 ureq = { version = "2", features = ["tls"] }
 base64 = "0.22"
@@ -75,6 +73,20 @@ no-asm = ["keccak"]
 keccak = "0.1"
 kernel32-sys = "0.2"
 win32console = "0.1"
+
+# OPoI inference backend, chosen at build time. candle's `cuda` and `metal` features
+# are mutually exclusive backends: CUDA for NVIDIA rigs, Metal for Apple Silicon.
+# On macOS the vendored `candle-kernels` patch below is unused (it is CUDA-only) and
+# cargo will emit a harmless "patch not used" warning.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+candle-core = { version = "0.9", features = ["cuda"] }
+candle-transformers = { version = "0.9", features = ["cuda"] }
+candle-nn = { version = "0.9", features = ["cuda"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.9", features = ["metal"] }
+candle-transformers = { version = "0.9", features = ["metal"] }
+candle-nn = { version = "0.9", features = ["metal"] }
 
 [profile.release]
 lto = true

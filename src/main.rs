@@ -495,12 +495,12 @@ async fn main() -> Result<(), Error> {
 
     // Verify GPU inference works before mining. OPoI challenges are mandatory, so a miner
     // that cannot run inference must fail fast with a clear message rather than spam panics.
-    info!("Probing GPU inference (cuBLAS) before mining…");
+    info!("Probing GPU inference before mining…");
     match tokio::task::spawn_blocking(keryx_miner::slm::probe_gpu_inference).await {
-        Ok(keryx_miner::slm::GpuProbe::Ok) => info!("GPU inference verified — cuBLAS loaded successfully."),
+        Ok(keryx_miner::slm::GpuProbe::Ok) => info!("GPU inference verified."),
         Ok(keryx_miner::slm::GpuProbe::NoCuda) => {
-            error!("No CUDA device detected — OPoI inference is GPU-only and is mandatory, cannot mine.");
-            return Err("No CUDA device — cannot start OPoI mining".into());
+            error!("No GPU inference device detected (CUDA on Linux/Windows, Metal on Apple Silicon) — OPoI inference is GPU-only and is mandatory, cannot mine.");
+            return Err("No GPU inference device — cannot start OPoI mining".into());
         }
         Ok(keryx_miner::slm::GpuProbe::CublasMissing) => {
             warn!("CUDA GPU detected but a CUDA runtime lib is missing — installing them automatically (one-time)…");

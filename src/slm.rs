@@ -882,12 +882,31 @@ pub fn advance_lineup_if_due(daa: u64) {
 
 /// Outcome of the startup GPU inference probe.
 pub enum GpuProbe {
-    /// A GPU matmul succeeded — cuBLAS is loaded and full-speed inference is available.
+    /// A GPU matmul succeeded — the accelerator (CUDA cuBLAS, or Metal) is ready for full-speed inference.
     Ok,
-    /// No CUDA device present — inference will fall back to CPU (acceptable for small models only).
+    /// No usable GPU device present (no CUDA device on Linux/Windows, or no Metal device on Apple Silicon).
+    /// OPoI inference is GPU-only, so this is fatal — the caller refuses to mine.
     NoCuda,
-    /// A CUDA device exists but cuBLAS could not be loaded — GPU inference is impossible.
+    /// CUDA-only: a CUDA device exists but cuBLAS could not be loaded — GPU inference is impossible.
+    /// Cannot occur on the Metal backend (Metal device creation fails cleanly as `NoCuda` instead).
     CublasMissing,
+}
+
+/// Open the GPU device OPoI inference runs on for this build target.
+///
+/// The backend is fixed at compile time to match candle's per-target features (see
+/// Cargo.toml): CUDA on Linux/Windows mining rigs, Metal on Apple Silicon. There is
+/// deliberately no CPU fallback — the OPoI models are far too large to run on CPU
+/// within the challenge deadline — so an unavailable accelerator is a hard error the
+/// callers report and refuse to mine on.
+#[cfg(not(target_os = "macos"))]
+fn new_inference_device() -> candle_core::Result<Device> {
+    Device::new_cuda(0)
+}
+
+#[cfg(target_os = "macos")]
+fn new_inference_device() -> candle_core::Result<Device> {
+    Device::new_metal(0)
 }
 
 /// Verify that GPU inference actually works *before* mining starts.
@@ -911,7 +930,7 @@ pub fn probe_gpu_inference() -> GpuProbe {
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let probe = std::panic::catch_unwind(|| {
-        let device = Device::new_cuda(0)?;
+        let device = new_inference_device()?;
         let a = Tensor::new(&[[1f32, 2.0], [3.0, 4.0]], &device)?;
         let b = Tensor::new(&[[5f32, 6.0], [7.0, 8.0]], &device)?;
         a.matmul(&b)?.to_vec2::<f32>()?;
@@ -1005,10 +1024,10 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
             // onto below (`Device::new_cuda(0)`); other devices' resident miners are left alone.
             crate::pom_gpu::uninstall(0);
             *guard = None;
-            let device = match Device::new_cuda(0) {
-                Ok(d) => { log::info!("SlmEngine: CUDA device 0 active"); d }
+            let device = match new_inference_device() {
+                Ok(d) => { log::info!("SlmEngine: GPU device 0 active"); d }
                 Err(e) => {
-                    log::error!("SlmEngine: CUDA device unavailable ({e}) — inference is GPU-only, cannot load '{}'", spec.name);
+                    log::error!("SlmEngine: GPU device unavailable ({e}) — inference is GPU-only, cannot load '{}'", spec.name);
                     return None;
                 }
             };
@@ -1072,10 +1091,10 @@ pub fn ensure_loaded(model_id: &[u8; 32]) -> bool {
         return true; // already resident
     }
     *guard = None;
-    let device = match Device::new_cuda(0) {
+    let device = match new_inference_device() {
         Ok(d) => d,
         Err(e) => {
-            log::error!("SlmEngine: ensure_loaded CUDA unavailable ({e}) — inference is GPU-only, cannot load '{}'", spec.name);
+            log::error!("SlmEngine: ensure_loaded GPU unavailable ({e}) — inference is GPU-only, cannot load '{}'", spec.name);
             return false;
         }
     };
