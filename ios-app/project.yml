@@ -19,7 +19,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.keryx.miner.ios
         INFOPLIST_FILE: Info.plist
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Bridge.h
-        OTHER_LINKER_FLAGS: -L$(SRCROOT)/../target/aarch64-apple-ios/release -lkeryx_miner -lresolv
+        OTHER_LINKER_FLAGS: -L$(SRCROOT)/../target/aarch64-apple-ios/release -Wl,-force_load,$(SRCROOT)/../target/aarch64-apple-ios/release/libkeryx_miner.a -lresolv
         LIBRARY_SEARCH_PATHS: $(SRCROOT)/../target/aarch64-apple-ios/release
         CLANG_ENABLE_MODULES: YES
     dependencies: []
