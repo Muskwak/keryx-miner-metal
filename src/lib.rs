@@ -23,6 +23,12 @@ type Hash = target::Uint256;
 #[cfg(target_os = "ios")]
 pub mod pow;
 
+// Sync watch channel (Condvar-based) — lets the async gRPC receiver hand the
+// latest block template to the blocking GPU mining thread, coalescing so the
+// miner never falls behind. Same module the desktop binary uses (main.rs).
+#[cfg(target_os = "ios")]
+mod watch;
+
 #[cfg(not(target_os = "ios"))]
 pub mod inference;
 #[cfg(not(target_os = "ios"))]

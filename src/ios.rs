@@ -12,7 +12,7 @@ use crate::proto::kaspad_message::Payload;
 use crate::proto::rpc_client::RpcClient;
 use crate::proto::{
     GetBlockTemplateRequestMessage, KaspadMessage, NotifyNewBlockTemplateRequestMessage,
-    RpcBlock, SubmitBlockRequestMessage,
+    SubmitBlockRequestMessage,
 };
 
 static GRPC_ADDRESS: OnceLock<String> = OnceLock::new();
@@ -299,7 +299,10 @@ async fn mining_loop(grpc_addr: String, mining_addr: String, mut stop_rx: watch:
         }
     };
 
-    let (req_tx, req_rx) = tokio::sync::mpsc::channel::<KaspadMessage>(64);
+    // Large outbound buffer (matches the desktop's 1024) so a burst of template
+    // requests + a block submission never queues up behind a full channel and
+    // stalls template delivery.
+    let (req_tx, req_rx) = tokio::sync::mpsc::channel::<KaspadMessage>(1024);
     let response = match client
         .message_stream(tokio_stream::wrappers::ReceiverStream::new(req_rx))
         .await
@@ -312,6 +315,20 @@ async fn mining_loop(grpc_addr: String, mining_addr: String, mut stop_rx: watch:
     };
 
     tokio::pin!(response);
+
+    // Job channel: this async receiver hands the *latest* block template to the
+    // blocking GPU mining thread. `crate::watch` coalesces — if templates arrive
+    // faster than the GPU grinds a batch, the miner just picks up the newest, so
+    // it can never build a backlog or mine a stale template. This mirrors the
+    // desktop's block_channel (watch::Sender) → launch_gpu_miner design.
+    let (job_tx, job_rx) =
+        crate::watch::channel::<Option<std::sync::Arc<crate::pow::State>>>(None);
+
+    // The GPU miner runs on its own OS thread: pom_gpu::mine() is a *blocking*
+    // call and must not run on the async executor — doing so previously starved
+    // this receive loop, so it fell behind the stream and mined stale templates.
+    let worker_req_tx = req_tx.clone();
+    let worker = std::thread::spawn(move || mining_worker(job_rx, worker_req_tx));
 
     // Subscribe to new block templates
     let _ = req_tx
@@ -331,8 +348,9 @@ async fn mining_loop(grpc_addr: String, mining_addr: String, mut stop_rx: watch:
         })
         .await;
 
-    let mut current_block: Option<RpcBlock> = None;
-    let mut nonce: u64 = 0;
+    // Throttle template logging: the node emits many templates/sec, which would
+    // otherwise drown the heartbeat and everything else in the 20-line log view.
+    let mut last_tmpl_log: Option<std::time::Instant> = None;
 
     loop {
         tokio::select! {
@@ -343,14 +361,28 @@ async fn mining_loop(grpc_addr: String, mining_addr: String, mut stop_rx: watch:
                             match payload {
                                 Payload::GetBlockTemplateResponse(r) => {
                                     if let Some(block) = r.block {
-                                        log_msg(&format!("ios: got block template DAA={}", block.header.as_ref().map(|h| h.daa_score).unwrap_or(0)));
-                                        // Reset nonce for the new block
-                                        current_block = Some(block);
-                                        nonce = 0;
+                                        let daa = block.header.as_ref().map(|h| h.daa_score).unwrap_or(0);
+                                        // Build the PoW/PoM State on the (cheap) async side, exactly
+                                        // like the desktop's process_block, then publish it to the
+                                        // miner thread. The watch coalesces intermediate templates.
+                                        match crate::pow::State::new(0, crate::pow::BlockSeed::FullBlock(Box::new(block))) {
+                                            Ok(s) => {
+                                                let _ = job_tx.send(Some(std::sync::Arc::new(s)));
+                                                let stale = last_tmpl_log
+                                                    .map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(2));
+                                                if stale {
+                                                    log_msg(&format!("ios: mining on latest template DAA={daa}"));
+                                                    last_tmpl_log = Some(std::time::Instant::now());
+                                                }
+                                            }
+                                            Err(e) => log_msg(&format!("ios: bad template DAA={daa}: {e}")),
+                                        }
                                     }
                                 }
                                 Payload::NewBlockTemplateNotification(_) => {
-                                    log_msg("ios: new block template available, requesting…");
+                                    // A new block landed — pull a fresh template. (No log: fires
+                                    // many times/sec; the throttled "mining on latest template"
+                                    // line above is the visible signal.)
                                     let _ = req_tx.send(KaspadMessage {
                                         payload: Some(Payload::GetBlockTemplateRequest(GetBlockTemplateRequestMessage {
                                             pay_address: next_pay_address(&mining_addr),
@@ -359,17 +391,10 @@ async fn mining_loop(grpc_addr: String, mining_addr: String, mut stop_rx: watch:
                                         })),
                                     }).await;
                                 }
-                                Payload::BlockAddedNotification(n) => {
-                                    if let Some(block) = n.block {
-                                        let daa = block.header.as_ref().map(|h| h.daa_score).unwrap_or(0);
-                                        log_msg(&format!("ios: block added DAA={}", daa));
-                                    }
-                                }
                                 Payload::SubmitBlockResponse(r) => {
                                     let reject = r.reject_reason();
-                                    log_msg(&format!("ios: submit block response: reject={:?}", reject));
+                                    log_msg(&format!("ios: submit block response: reject={reject:?}"));
                                 }
-                                Payload::NotifyNewBlockTemplateResponse(_) => {}
                                 _ => {}
                             }
                         }
@@ -391,88 +416,128 @@ async fn mining_loop(grpc_addr: String, mining_addr: String, mut stop_rx: watch:
                 }
             }
         }
+    }
 
-        // Mine on the current block if available
-        if let Some(ref block) = current_block {
-            if let Some(ref header) = block.header {
-                let daa_score = header.daa_score;
+    // Dropping the job sender closes the channel; the worker sees it on its next
+    // batch boundary (or wakes from wait_for_change) and exits. Then join it.
+    drop(job_tx);
+    let _ = worker.join();
+    log_msg("ios: mining loop ended");
+}
 
-                // Create State for PoM mining
-                let state = match crate::pow::State::new(0, crate::pow::BlockSeed::FullBlock(Box::new(block.clone()))) {
-                    Ok(s) => s,
-                    Err(_) => continue,
+/// Blocking GPU mining thread — a faithful port of the desktop's
+/// `launch_gpu_miner` PoM branch (src/miner.rs). Reads the latest template from
+/// the coalescing `watch` channel, grinds one `pom_gpu::mine` batch at a time on
+/// a persistent (never-reset) nonce cursor, and submits winning blocks via the
+/// shared outbound channel. Runs on its own OS thread so the blocking `mine`
+/// call never starves the async gRPC receiver.
+fn mining_worker(
+    mut job_rx: crate::watch::Receiver<Option<std::sync::Arc<crate::pow::State>>>,
+    req_tx: tokio::sync::mpsc::Sender<KaspadMessage>,
+) {
+    // Persistent nonce cursor: advances by BATCH_SIZE each batch and is NOT reset
+    // per template (each (template, nonce) is an independent PoM trial). Random-ish
+    // start so relaunches don't all begin at nonce 0.
+    let mut pom_nonce: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+
+    let mut state: Option<std::sync::Arc<crate::pow::State>> = None;
+
+    loop {
+        if !RUNNING.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // No job yet → block until the receiver publishes one (or the channel closes).
+        if state.is_none() {
+            match job_rx.wait_for_change() {
+                Ok(s) => state = s,
+                Err(_) => break, // sender dropped → stop
+            }
+            continue;
+        }
+        let s = state.clone().unwrap();
+        let daa = s.daa_score;
+
+        // One-time heavy model load (index build + Metal GPU upload). A `false`
+        // here is surfaced (the log bridge forwards the underlying error); we back
+        // off and retry rather than spin invisibly.
+        if !INSTALLED_OK.load(Ordering::Relaxed) {
+            log_msg(&format!("ios: loading PoM model into GPU (one-time) at DAA={daa}…"));
+            if pom_gpu::ensure_installed(0, daa) {
+                INSTALLED_OK.store(true, Ordering::Relaxed);
+                log_msg("ios: PoM model installed — mining now active");
+            } else {
+                log_msg("ios: ERROR ensure_installed returned false (see [ERROR]/[WARN] above) — retrying");
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if let Ok(Some(ns)) = job_rx.get_changed() {
+                    if ns.is_some() {
+                        state = ns;
+                    }
+                }
+                continue;
+            }
+        }
+
+        let (index, tier) = match pom::active_index() {
+            Some(x) => x,
+            None => {
+                log_msg("ios: ERROR active_index() None after install — retrying");
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                continue;
+            }
+        };
+
+        let mut pph = [0u8; 32];
+        pph.copy_from_slice(&s.pow_hash_header[..32]);
+        let timestamp = u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap());
+        let target_le = s.target.to_le_bytes();
+
+        let t0 = std::time::Instant::now();
+        let found = pom_gpu::mine(0, &pph, timestamp, &target_le, pom_nonce, BATCH_SIZE);
+        pom_nonce = pom_nonce.wrapping_add(BATCH_SIZE);
+
+        let batches = BATCH_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if batches % HEARTBEAT_BATCHES == 0 {
+            let secs = t0.elapsed().as_secs_f64().max(1e-6);
+            let mhs = (BATCH_SIZE as f64 / secs) / 1e6;
+            log_msg(&format!("ios: mining… {batches} batches, {mhs:.2} MH/s"));
+        }
+
+        if let Some(winning_nonce) = found {
+            log_msg(&format!("ios: PoM winner nonce={winning_nonce}"));
+            if let Some(crate::pow::BlockSeed::FullBlock(found_block)) =
+                s.generate_block_if_pom(winning_nonce, index, *tier)
+            {
+                NONCES_FOUND.fetch_add(1, Ordering::Relaxed);
+                log_msg("ios: submitting block…");
+                let msg = KaspadMessage {
+                    payload: Some(Payload::SubmitBlockRequest(SubmitBlockRequestMessage {
+                        block: Some(*found_block),
+                        allow_non_daa_blocks: false,
+                    })),
                 };
-
-                // Build/ensure PoM index. First call is the heavy one-time model
-                // load (index build + Metal GPU upload). Its result was previously
-                // discarded — a `false` here (index build error, Metal load error,
-                // chunk-count mismatch) left active_index() None so the loop just
-                // `continue`d forever with no visible reason. Now we surface it, and
-                // the `log` bridge forwards the underlying error to the UI.
-                if !INSTALLED_OK.load(Ordering::Relaxed) {
-                    log_msg(&format!("ios: loading PoM model into GPU (one-time) at DAA={daa_score}…"));
-                    if pom_gpu::ensure_installed(0, daa_score) {
-                        INSTALLED_OK.store(true, Ordering::Relaxed);
-                        log_msg("ios: PoM model installed — mining now active");
-                    } else {
-                        log_msg("ios: ERROR ensure_installed returned false (see [ERROR]/[WARN] lines above) — retrying next template");
-                        continue;
+                let _ = req_tx.blocking_send(msg);
+            }
+            // This template is consumed — wait for a fresh one.
+            state = None;
+        } else {
+            // No winner: swap to a fresher template if one arrived (coalesced),
+            // else keep grinding the current one with the advanced nonce cursor.
+            match job_rx.get_changed() {
+                Ok(Some(ns)) => {
+                    if ns.is_some() {
+                        state = ns;
                     }
                 }
-
-                let (index, tier) = match pom::active_index() {
-                    Some(x) => x,
-                    None => {
-                        log_msg("ios: ERROR active_index() is None after install — retrying");
-                        continue;
-                    }
-                };
-
-                let mut pph = [0u8; 32];
-                pph.copy_from_slice(&state.pow_hash_header[..32]);
-                let timestamp = u64::from_le_bytes(state.pow_hash_header[32..40].try_into().unwrap());
-                let target_le = state.target.to_le_bytes();
-
-                let batch_start = nonce;
-                let t0 = std::time::Instant::now();
-                let found = pom_gpu::mine(0, &pph, timestamp, &target_le, batch_start, BATCH_SIZE);
-                nonce = nonce.wrapping_add(BATCH_SIZE);
-
-                // Heartbeat: without this, mining is completely silent and
-                // indistinguishable from a stall. Log a rough hashrate every
-                // HEARTBEAT_BATCHES batches.
-                let batches = BATCH_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                if batches % HEARTBEAT_BATCHES == 0 {
-                    let secs = t0.elapsed().as_secs_f64().max(1e-6);
-                    let mhs = (BATCH_SIZE as f64 / secs) / 1e6;
-                    log_msg(&format!("ios: mining… {batches} batches, last batch {mhs:.2} MH/s, nonce@{nonce}"));
-                }
-
-                if let Some(winning_nonce) = found {
-                    log_msg(&format!("ios: PoM winning nonce found: {}", winning_nonce));
-                    if let Some(block_seed) = state.generate_block_if_pom(winning_nonce, index, *tier) {
-                        match block_seed {
-                            crate::pow::BlockSeed::FullBlock(found_block) => {
-                                NONCES_FOUND.fetch_add(1, Ordering::Relaxed);
-                                log_msg("ios: submitting block…");
-                                let _ = req_tx
-                                    .send(KaspadMessage {
- payload: Some(Payload::SubmitBlockRequest(SubmitBlockRequestMessage {
- block: Some(*found_block.clone()),
- allow_non_daa_blocks: false,
- })),
-                                    })
-                                    .await;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+                Ok(None) => {}
+                Err(_) => break, // sender dropped → stop
             }
         }
     }
-
-    log_msg("ios: mining loop ended");
+    log_msg("ios: mining worker exited");
 }
 
 #[no_mangle]
