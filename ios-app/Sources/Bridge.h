@@ -8,6 +8,7 @@
 #include <stdbool.h>
 
 extern bool keryx_miner_connect(const char *address);
+extern bool keryx_miner_set_mining_address(const char *address);
 extern bool keryx_miner_start(void);
 extern void keryx_miner_stop(void);
 extern char *keryx_miner_status(void);

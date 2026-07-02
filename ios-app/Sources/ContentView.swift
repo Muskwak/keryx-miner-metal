@@ -4,6 +4,9 @@ import SwiftUI
 @_silgen_name("keryx_miner_connect")
 func keryx_miner_connect(_ address: UnsafePointer<CChar>) -> Bool
 
+@_silgen_name("keryx_miner_set_mining_address")
+func keryx_miner_set_mining_address(_ address: UnsafePointer<CChar>) -> Bool
+
 @_silgen_name("keryx_miner_start")
 func keryx_miner_start() -> Bool
 
@@ -18,6 +21,7 @@ func keryx_miner_free_string(_ s: UnsafeMutablePointer<CChar>?)
 
 struct ContentView: View {
     @State private var grpcAddress: String = "127.0.0.1:22110"
+    @State private var miningAddress: String = ""
     @State private var isMining: Bool = false
     @State private var logLines: [String] = ["keryx-miner iOS — ready"]
     @State private var statusTimer: Timer?
@@ -29,6 +33,17 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("gRPC Address").font(.caption).foregroundColor(.secondary)
                     TextField("host:port", text: $grpcAddress)
+                        .textFieldStyle(.roundedBorder)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+                        .disabled(isMining)
+                }
+                .padding(.horizontal)
+
+                // Mining address input
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Mining Address (wallet)").font(.caption).foregroundColor(.secondary)
+                    TextField("keryx:...", text: $miningAddress)
                         .textFieldStyle(.roundedBorder)
                         .autocapitalization(.none)
                         .disableAutocorrection(true)
@@ -90,13 +105,16 @@ struct ContentView: View {
             logLines.append("ERROR: enter a gRPC address first")
             return
         }
-        let ok = addr.withCString { ptr in
-            keryx_miner_connect(ptr)
-        }
-        guard ok else {
+        guard addr.withCString({ ptr in keryx_miner_connect(ptr) }) else {
             logLines.append("ERROR: keryx_miner_connect failed")
             return
         }
+
+        let wallet = miningAddress.trimmingCharacters(in: .whitespaces)
+        if !wallet.isEmpty {
+            _ = wallet.withCString({ ptr in keryx_miner_set_mining_address(ptr) })
+        }
+
         guard keryx_miner_start() else {
             logLines.append("ERROR: keryx_miner_start failed (already running?)")
             return

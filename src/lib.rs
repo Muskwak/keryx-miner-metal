@@ -8,6 +8,21 @@ pub mod pom_gpu;
 pub mod slm;
 pub mod xoshiro256starstar;
 
+#[cfg(target_os = "ios")]
+pub mod proto {
+    #![allow(clippy::derive_partial_eq_without_eq)]
+    tonic::include_proto!("protowire");
+}
+
+#[cfg(target_os = "ios")]
+pub mod target;
+
+#[cfg(target_os = "ios")]
+type Hash = target::Uint256;
+
+#[cfg(target_os = "ios")]
+pub mod pow;
+
 #[cfg(not(target_os = "ios"))]
 pub mod inference;
 #[cfg(not(target_os = "ios"))]
