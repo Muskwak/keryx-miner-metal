@@ -1,20 +1,25 @@
 // Keryx Proof-of-Model mining kernel (Metal, Apple Silicon port).
 //
 // Port of cuda/pom_mine.cu. Per nonce: seed-fold + data-dependent gather walk over the
-// resident (packed) weight blob + pow-fold + target check. The seed/pow folds are
+// resident (zero-dup) weight blob + pow-fold + target check. The seed/pow folds are
 // byte-identical to `pom_mine.cu::pom_seed_fold`/`pom_pow_fold` and the host
-// `pom::pom_block_seed`/`pom::pom_pow_value`, so nonces mined here build proofs the node
-// accepts.
+// `pom::pom_block_seed`/`pom::pom_pow_value`, so nonces mined here build proofs the
+// node accepts.
 //
-// Two shape differences vs the CUDA kernel:
+// Layout — bindless walk over candle's own MTLBuffers (Metal 3 / MSL 3, Apple Silicon):
 //
-//   1. Weights are laid out as a single packed device buffer, in the canonical name-sorted
-//      GGUF tensor order — the same order the CUDA gather is built over — so chunk `off`
-//      lives at bytes [off*32..off*32+32]. No per-tensor (bases,prefix) binary search.
-//   2. `winner` is an `atomic_uint` holding the winning tid (0..n_nonces); Metal does not
-//      guarantee `atomic_ulong`. Host reconstructs the nonce as `nonce_base + tid`. Since
-//      POM_BATCH is 1<<20 and always < 2^32, this is byte-identical to CUDA's
-//      `atomicMin(winner, nonce)`.
+//   * `prefix[i]` is the cumulative chunk count of tensors [0..i); it has length
+//     n_tensors + 1 so the terminating sentinel is `prefix[n_tensors] == n_total_chunks`.
+//     A chunk is 32 bytes (four ulongs) — the same slicing the CUDA path uses.
+//   * `tensor_addrs[i]` is the raw GPU address of tensor i's MTLBuffer, i.e.
+//     `[buffer gpuAddress]`. In Metal 3 argument-buffer Tier-2 (guaranteed on Apple
+//     Silicon) these are plain 64-bit pointers we can reinterpret to
+//     `device const ulong*`. The host calls `use_resource` on each tensor buffer at
+//     dispatch time so the driver keeps them resident even though nothing else binds them.
+//   * `winner` is an `atomic_uint` holding the winning tid (0..n_nonces); Metal does not
+//     guarantee `atomic_ulong`. Host reconstructs the nonce as `nonce_base + tid`. Since
+//     POM_BATCH is 1<<20 and always < 2^32, this is byte-identical to CUDA's
+//     `atomicMin(winner, nonce)`.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -22,13 +27,13 @@ using namespace metal;
 struct PomUniforms {
     ulong  n_total_chunks;
     uint   k_steps;
-    uint   _pad;
+    uint   n_tensors;
     ulong  p0; ulong p1; ulong p2; ulong p3;
     ulong  time_;
     ulong  t0; ulong t1; ulong t2; ulong t3;
     ulong  nonce_base;
     uint   n_nonces;
-    uint   _pad2;
+    uint   _pad;
 };
 
 inline ulong mix64(ulong x) {
@@ -62,10 +67,23 @@ inline bool pom_le_leq(thread const ulong* a,
     return a[0] <= b0;
 }
 
+// Binary search: largest i in [0, n_tensors] such that prefix[i] <= off.
+// Mirrors the `bases[]` upper_bound in cuda/pom_mine.cu.
+inline uint upper_bound_prefix(device const ulong* prefix, uint n_tensors, ulong off) {
+    uint lo = 0;
+    uint hi = n_tensors; // sentinel prefix[n_tensors] == n_total_chunks > off
+    while (lo + 1 < hi) {
+        uint mid = (lo + hi) >> 1;
+        if (prefix[mid] <= off) { lo = mid; } else { hi = mid; }
+    }
+    return lo;
+}
+
 kernel void pom_mine(
-    device   const ulong*   weights [[buffer(0)]],
-    constant const PomUniforms& u   [[buffer(1)]],
-    device   atomic_uint*   winner  [[buffer(2)]],
+    device   const ulong*        prefix       [[buffer(0)]],  // n_tensors + 1 entries, in chunks
+    device   const ulong*        tensor_addrs [[buffer(1)]],  // n_tensors gpu addresses
+    constant const PomUniforms&  u            [[buffer(2)]],
+    device   atomic_uint*        winner       [[buffer(3)]],
     uint tid [[thread_position_in_grid]])
 {
     if (tid >= u.n_nonces) return;
@@ -74,12 +92,18 @@ kernel void pom_mine(
     ulong state = pom_seed_fold(nonce, u.time_, u.p0, u.p1, u.p2, u.p3);
     ulong off = state % u.n_total_chunks;
     for (uint i = 0; i < u.k_steps; i++) {
-        ulong base = off * 4UL;
+        uint idx = upper_bound_prefix(prefix, u.n_tensors, off);
+        ulong local = off - prefix[idx];
+        // Bindless deref (MSL 3 / Apple Silicon Tier-2 argbufs): the u64 in
+        // tensor_addrs[] is a raw GPU pointer; reinterpret it as a device pointer.
+        device const ulong* ptr =
+            reinterpret_cast<device const ulong*>(tensor_addrs[idx]);
+        ulong base = local * 4UL;
         ulong h = state;
-        h ^= weights[base + 0];
-        h ^= weights[base + 1];
-        h ^= weights[base + 2];
-        h ^= weights[base + 3];
+        h ^= ptr[base + 0];
+        h ^= ptr[base + 1];
+        h ^= ptr[base + 2];
+        h ^= ptr[base + 3];
         state = mix64(h);
         off = state % u.n_total_chunks;
     }

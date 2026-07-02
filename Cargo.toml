@@ -116,9 +116,20 @@ sha3 = { git = "https://github.com/elichai/hashes", branch = "cSHAKE" }
 members = ["inference", "plugins/*"]
 default-members = [".", "plugins/cuda", "plugins/opencl"]
 
-# Vendored candle-kernels: the upstream MoE bf16 WMMA kernels only compile for
-# sm_80+, which would exclude Turing/Pascal (and thus all pre-Ampere miners) from
-# inference. The vendored copy guards those kernel bodies with `#if __CUDA_ARCH__
-# >= 800` so the crate builds at sm_75 (stub on older archs, real MoE on sm_80+).
+# Vendored candle patches:
+#   * candle-kernels — upstream MoE bf16 WMMA kernels only compile for sm_80+,
+#     which would exclude Turing/Pascal (and thus all pre-Ampere miners) from
+#     inference. The vendored copy guards those kernel bodies with
+#     `#if __CUDA_ARCH__ >= 800` so the crate builds at sm_75 (stub on older
+#     archs, real MoE on sm_80+).
+#   * candle-core — upstream keeps `QTensor::storage` private and returns an
+#     unimplemented `device_ptr` on the Metal branch, so the Metal PoM miner
+#     cannot see candle's own `MTLBuffer`s and would be forced to blit every
+#     tensor out of unified memory into a packed weight buffer. The vendored
+#     copy adds `QTensor::metal_storage(&self) -> Option<&QMetalStorage>` so
+#     the miner can build a bindless pointer table over the existing buffers
+#     and skip the copy. Linux/Windows CUDA builds keep the crates.io copy —
+#     cargo will emit a harmless "patch not used" warning there.
 [patch.crates-io]
 candle-kernels = { path = "vendor/candle-kernels" }
+candle-core = { path = "vendor/candle-core" }

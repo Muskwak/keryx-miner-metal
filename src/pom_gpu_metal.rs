@@ -2,16 +2,22 @@
 //!
 //! Same public free-function surface as the CUDA module (`install`/`uninstall`/`is_installed`/
 //! `is_loading`/`mine`/`current_tier`/`ensure_installed`/`set_mining_tier`) so callers in
-//! main.rs / miner.rs / slm.rs are backend-agnostic. Under the hood:
+//! main.rs / miner.rs / slm.rs are backend-agnostic. Under the hood this is a **zero-dup**
+//! walk over candle's own resident `MTLBuffer`s: no packed weight blob, no host copy of the
+//! quantized bytes. Instead we build two small side tables once at load time:
 //!
-//!   * Weights are packed into ONE Metal buffer in canonical (name-sorted) GGUF tensor order —
-//!     the same order the CUDA gather is built over — so a chunk at global index `off` lives
-//!     at bytes `[off*32 .. off*32+32]`. The Metal kernel drops the per-tensor (bases, prefix)
-//!     binary search the CUDA path needs, because candle 0.9 does not publicly expose
-//!     `QMetalStorage::buffer` from a `QTensor` — so we cannot do zero-dup here yet. Cost is one
-//!     extra weight-sized allocation in unified memory; acceptable while Metal stays opt-in.
-//!   * `metal/pom_mine.metal` is `include_str!`d and compiled the first time the miner loads.
-//!     One `ComputePipeline` cached per miner instance.
+//!   * `prefix`  — cumulative 32-byte-chunk count per tensor in canonical (name-sorted)
+//!     GGUF order, length `n_tensors + 1`. Matches the layout `pom-rt-builder` / the node's
+//!     `R_T` root are built over, so a global chunk index is the same address here and there.
+//!   * `addrs`   — `MTLBuffer.gpuAddress()` per tensor. In Metal 3 (Apple Silicon is always
+//!     Tier-2 argument buffers) these are plain 64-bit pointers the kernel reinterprets to
+//!     `device const ulong*`. We call `use_resource` on each tensor buffer before dispatch
+//!     so the driver keeps them GPU-resident even though nothing else binds them.
+//!
+//! The MTLBuffer handles are the very ones candle-core holds inside `QMetalStorage`; we get
+//! at them through the vendored `QTensor::metal_storage()` accessor added in
+//! `vendor/candle-core/src/quantized/mod.rs`. Cloning a `Buffer` just bumps the objc2 retain
+//! count — no data is copied.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,21 +25,23 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use log::info;
 
-use candle_core::quantized::{gguf_file, QTensor};
+use candle_core::quantized::gguf_file;
 use candle_core::Device;
 use candle_metal_kernels::metal::{
     create_command_buffer, Buffer, CommandQueue, CommandSemaphore, ComputePipeline,
     Device as MtlDevice, MTLResourceOptions,
 };
-use objc2_metal::{MTLResourceOptions as ObjcMTLResourceOptions, MTLSize};
+use objc2_metal::{
+    MTLBuffer as _, MTLResourceOptions as ObjcMTLResourceOptions, MTLResourceUsage, MTLSize,
+};
 
 const METAL_SRC: &str = include_str!("../metal/pom_mine.metal");
 const CHUNK_BYTES: usize = 32;
 const THREADGROUP_SIZE: usize = 256;
 
 /// Shared-storage buffers: CPU and GPU see the same unified-memory backing, so the host can
-/// write uniforms / read the winner without a blit copy. See candle's own RESOURCE_OPTIONS
-/// for the same choice on candle's transient buffers.
+/// write uniforms / read the winner without a blit copy. Same choice candle uses for its
+/// own transient buffers.
 const SHARED_STORAGE: MTLResourceOptions =
     ObjcMTLResourceOptions(ObjcMTLResourceOptions::StorageModeShared.bits());
 
@@ -41,9 +49,17 @@ pub struct PomGpuMiner {
     device: MtlDevice,
     queue: CommandQueue,
     pipeline: ComputePipeline,
-    weights: Buffer,
+    /// Prefix sums of chunk counts across tensors, length `n_tensors + 1`, in chunks.
+    prefix_buf: Buffer,
+    /// GPU addresses of the resident per-tensor MTLBuffers, length `n_tensors`.
+    addrs_buf: Buffer,
+    /// Clones of the candle-owned per-tensor MTLBuffers. Kept for two reasons:
+    ///   (a) they hold the retain count that keeps the unified-memory backing alive, and
+    ///   (b) we hand them to `use_resource` on every dispatch so the driver marks them
+    ///       resident even though the kernel binds only the addrs/prefix tables.
+    resources: Vec<Buffer>,
     n_total_chunks: u64,
-    _tensors: Vec<QTensor>, // kept alive so any device-side buffers aren't dropped early
+    n_tensors: u32,
 }
 
 // Matches PomUniforms in metal/pom_mine.metal — field order and padding are load-bearing.
@@ -51,18 +67,18 @@ pub struct PomGpuMiner {
 struct Uniforms {
     n_total_chunks: u64,
     k_steps: u32,
-    _pad0: u32,
+    n_tensors: u32,
     p0: u64, p1: u64, p2: u64, p3: u64,
     time_: u64,
     t0: u64, t1: u64, t2: u64, t3: u64,
     nonce_base: u64,
     n_nonces: u32,
-    _pad1: u32,
+    _pad: u32,
 }
 
 impl PomGpuMiner {
-    /// Load the mining model's GGUF into a candle Metal device, pack it into a single Metal
-    /// buffer, compile the kernel. Heavy — call once per (device, model).
+    /// Load the mining model's GGUF into a candle Metal device and build the bindless walk
+    /// tables. Heavy — call once per (device, model).
     pub fn load(gguf_path: &str, device_id: usize) -> candle_core::Result<Self> {
         let cdev = Device::new_metal(device_id)?;
         let mdev = match &cdev {
@@ -75,32 +91,50 @@ impl PomGpuMiner {
         let mut names: Vec<String> = content.tensor_infos.keys().cloned().collect();
         names.sort(); // canonical name-sorted order — matches pom-rt-builder / the node R_T
 
-        let mut tensors: Vec<QTensor> = Vec::with_capacity(names.len());
-        let mut packed: Vec<u8> = Vec::new();
+        let mut resources: Vec<Buffer> = Vec::with_capacity(names.len());
+        let mut addrs: Vec<u64> = Vec::with_capacity(names.len());
+        let mut prefix: Vec<u64> = Vec::with_capacity(names.len() + 1);
+        prefix.push(0);
+        let mut cum: u64 = 0;
+
         for name in &names {
             let qt = content.tensor(&mut file, name, &cdev)?;
-            let n = qt.storage_size_in_bytes();
-            if n < CHUNK_BYTES {
-                tensors.push(qt);
+            let n_bytes = qt.storage_size_in_bytes();
+            if n_bytes < CHUNK_BYTES {
+                // Skip tiny tensors (biases, norms, etc.) — same behaviour as the CUDA gather.
                 continue;
             }
-            let bytes = qt.data()?;
-            let usable = (n / CHUNK_BYTES) * CHUNK_BYTES; // defensive vs any ragged tail
-            packed.extend_from_slice(&bytes[..usable]);
-            tensors.push(qt);
+            let qmet = qt.metal_storage().ok_or_else(|| {
+                candle_core::Error::Msg("PoM Metal: QTensor has no Metal storage".into())
+            })?;
+            let buf: Buffer = qmet.buffer().clone();
+            let addr = buf.as_ref().gpuAddress();
+            let n_chunks = (n_bytes / CHUNK_BYTES) as u64;
+            cum += n_chunks;
+            prefix.push(cum);
+            addrs.push(addr);
+            resources.push(buf);
         }
-        let n_total_chunks = (packed.len() / CHUNK_BYTES) as u64;
-        if n_total_chunks == 0 {
+        let n_total_chunks = cum;
+        let n_tensors = resources.len() as u32;
+        if n_total_chunks == 0 || n_tensors == 0 {
             return Err(candle_core::Error::Msg("PoM Metal: model produced 0 chunks".into()));
         }
 
-        let weights = mdev
+        let prefix_buf = mdev
             .new_buffer_with_data(
-                packed.as_ptr() as *const _,
-                packed.len(),
+                prefix.as_ptr() as *const _,
+                std::mem::size_of_val(&prefix[..]),
                 SHARED_STORAGE,
             )
-            .map_err(|e| candle_core::Error::Msg(format!("PoM Metal: weights buffer: {e}")))?;
+            .map_err(|e| candle_core::Error::Msg(format!("PoM Metal: prefix buffer: {e}")))?;
+        let addrs_buf = mdev
+            .new_buffer_with_data(
+                addrs.as_ptr() as *const _,
+                std::mem::size_of_val(&addrs[..]),
+                SHARED_STORAGE,
+            )
+            .map_err(|e| candle_core::Error::Msg(format!("PoM Metal: addrs buffer: {e}")))?;
 
         let library = mdev
             .new_library_with_source(METAL_SRC, None)
@@ -117,13 +151,23 @@ impl PomGpuMiner {
             .map_err(|e| candle_core::Error::Msg(format!("PoM Metal: command queue: {e}")))?;
 
         info!(
-            "PoM Metal: packed {} chunks ({} MiB) on device {}",
+            "PoM Metal: {} tensors, {} chunks (~{} MiB) resident on device {} (zero-dup)",
+            n_tensors,
             n_total_chunks,
-            packed.len() / (1024 * 1024),
+            (n_total_chunks as usize * CHUNK_BYTES) / (1024 * 1024),
             device_id
         );
 
-        Ok(Self { device: mdev, queue, pipeline, weights, n_total_chunks, _tensors: tensors })
+        Ok(Self {
+            device: mdev,
+            queue,
+            pipeline,
+            prefix_buf,
+            addrs_buf,
+            resources,
+            n_total_chunks,
+            n_tensors,
+        })
     }
 
     pub fn n_chunks(&self) -> u64 {
@@ -152,13 +196,13 @@ impl PomGpuMiner {
         let uniforms = Uniforms {
             n_total_chunks: self.n_total_chunks,
             k_steps: crate::pom::POM_WALK_STEPS,
-            _pad0: 0,
+            n_tensors: self.n_tensors,
             p0: p[0], p1: p[1], p2: p[2], p3: p[3],
             time_: timestamp,
             t0: t[0], t1: t[1], t2: t[2], t3: t[3],
             nonce_base: start,
             n_nonces: batch as u32,
-            _pad1: 0,
+            _pad: 0,
         };
 
         let uniforms_buf = self
@@ -184,9 +228,16 @@ impl PomGpuMiner {
             .map_err(|e| candle_core::Error::Msg(format!("PoM Metal: command buffer: {e}")))?;
         let enc = cmd.compute_command_encoder();
         enc.set_compute_pipeline_state(&self.pipeline);
-        enc.set_buffer(0, Some(&self.weights), 0);
-        enc.set_buffer(1, Some(&uniforms_buf), 0);
-        enc.set_buffer(2, Some(&winner_buf), 0);
+        enc.set_buffer(0, Some(&self.prefix_buf), 0);
+        enc.set_buffer(1, Some(&self.addrs_buf), 0);
+        enc.set_buffer(2, Some(&uniforms_buf), 0);
+        enc.set_buffer(3, Some(&winner_buf), 0);
+        // Bindless: the resident per-tensor buffers are dereffed via raw gpuAddress inside
+        // the kernel, so nothing here binds them to a slot. We must still tell the driver
+        // they'll be read — otherwise it can page them out or omit residency tracking.
+        for buf in &self.resources {
+            enc.use_resource(buf, MTLResourceUsage::Read);
+        }
         let grid = MTLSize { width: batch as usize, height: 1, depth: 1 };
         let tg = MTLSize { width: THREADGROUP_SIZE, height: 1, depth: 1 };
         enc.dispatch_threads(grid, tg);
@@ -320,7 +371,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     if let Some((idx, _)) = crate::pom::active_index() {
         if n != idx.n_chunks {
             log::error!(
-                "PoM Metal[gpu{}]: packed N={} != shared index N={} — refusing to mine",
+                "PoM Metal[gpu{}]: resident N={} != shared index N={} — refusing to mine",
                 device_id, n, idx.n_chunks
             );
             return false;
