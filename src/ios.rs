@@ -21,8 +21,14 @@ static NONCES_FOUND: AtomicU64 = AtomicU64::new(0);
 static LAST_LOG: OnceLock<Mutex<String>> = OnceLock::new();
 static RUNNING: AtomicBool = AtomicBool::new(false);
 static STOP_TX: OnceLock<watch::Sender<bool>> = OnceLock::new();
+/// Set true once the heavy one-time PoM model load (index + Metal upload) has
+/// succeeded, so we log it once and don't re-attempt on every template.
+static INSTALLED_OK: AtomicBool = AtomicBool::new(false);
+/// Total GPU mining batches dispatched — drives the heartbeat log.
+static BATCH_COUNT: AtomicU64 = AtomicU64::new(0);
 
 const BATCH_SIZE: u64 = 1 << 20;
+const HEARTBEAT_BATCHES: u64 = 16;
 
 /// Same mechanism as the desktop CLI's `--devfund-percent` (src/cli.rs,
 /// src/client/grpc.rs::get_block_template): out of every 10_000 block-template
@@ -57,6 +63,48 @@ fn log_msg(msg: &str) {
             *log = log.split_off(len - 32768);
         }
     }
+}
+
+/// Bridges the `log` crate into the on-screen status log. On iOS there is no
+/// `main()` to call `env_logger::init()` (that only runs in the desktop binary),
+/// so every `log::info!/warn!/error!` inside pom.rs / pom_gpu.rs / slm.rs was a
+/// silent no-op — which is why a failing `ensure_installed()` looked like the
+/// miner just bouncing between "got block template" and "requesting" with no
+/// visible reason. This forwards those records to `log_msg` so the actual error
+/// (index build failure, model load OOM, chunk-count mismatch, …) is visible.
+struct IosLogger;
+
+impl log::Log for IosLogger {
+    fn enabled(&self, meta: &log::Metadata) -> bool {
+        // Always surface warnings/errors. For info/debug, only forward our own
+        // mining-relevant modules — otherwise tonic/h2/hyper flood the UI.
+        meta.level() <= log::Level::Warn
+            || meta.target().contains("pom")
+            || meta.target().contains("slm")
+            || meta.target().contains("keryx")
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            log_msg(&format!("[{}] {}", record.level(), record.args()));
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static IOS_LOGGER: IosLogger = IosLogger;
+static LOGGER_SET: OnceLock<()> = OnceLock::new();
+
+/// Idempotent: safe to call from both `keryx_miner_initialize` and
+/// `keryx_miner_start` (whichever runs first wins; `set_logger` errors if
+/// already set, which we ignore).
+fn install_log_bridge() {
+    LOGGER_SET.get_or_init(|| {
+        if log::set_logger(&IOS_LOGGER).is_ok() {
+            log::set_max_level(log::LevelFilter::Info);
+        }
+    });
 }
 
 static MODEL_BASE: OnceLock<std::path::PathBuf> = OnceLock::new();
@@ -118,6 +166,7 @@ fn ensure_mining_model_ready() -> bool {
 /// happens while the user is looking at the UI, not after they tap Start.
 #[no_mangle]
 pub extern "C" fn keryx_miner_initialize() -> bool {
+    install_log_bridge();
     ensure_mining_model_ready()
 }
 
@@ -183,6 +232,7 @@ pub extern "C" fn keryx_miner_set_mining_address(address: *const std::ffi::c_cha
 
 #[no_mangle]
 pub extern "C" fn keryx_miner_start() -> bool {
+    install_log_bridge();
     if RUNNING.swap(true, Ordering::SeqCst) {
         return false;
     }
@@ -353,13 +403,27 @@ async fn mining_loop(grpc_addr: String, mining_addr: String, mut stop_rx: watch:
                     Err(_) => continue,
                 };
 
-                // Build/ensure PoM index
-                pom_gpu::ensure_installed(0, daa_score);
+                // Build/ensure PoM index. First call is the heavy one-time model
+                // load (index build + Metal GPU upload). Its result was previously
+                // discarded — a `false` here (index build error, Metal load error,
+                // chunk-count mismatch) left active_index() None so the loop just
+                // `continue`d forever with no visible reason. Now we surface it, and
+                // the `log` bridge forwards the underlying error to the UI.
+                if !INSTALLED_OK.load(Ordering::Relaxed) {
+                    log_msg(&format!("ios: loading PoM model into GPU (one-time) at DAA={daa_score}…"));
+                    if pom_gpu::ensure_installed(0, daa_score) {
+                        INSTALLED_OK.store(true, Ordering::Relaxed);
+                        log_msg("ios: PoM model installed — mining now active");
+                    } else {
+                        log_msg("ios: ERROR ensure_installed returned false (see [ERROR]/[WARN] lines above) — retrying next template");
+                        continue;
+                    }
+                }
 
                 let (index, tier) = match pom::active_index() {
                     Some(x) => x,
                     None => {
-                        // Index not ready yet — try again next iteration
+                        log_msg("ios: ERROR active_index() is None after install — retrying");
                         continue;
                     }
                 };
@@ -370,8 +434,19 @@ async fn mining_loop(grpc_addr: String, mining_addr: String, mut stop_rx: watch:
                 let target_le = state.target.to_le_bytes();
 
                 let batch_start = nonce;
+                let t0 = std::time::Instant::now();
                 let found = pom_gpu::mine(0, &pph, timestamp, &target_le, batch_start, BATCH_SIZE);
                 nonce = nonce.wrapping_add(BATCH_SIZE);
+
+                // Heartbeat: without this, mining is completely silent and
+                // indistinguishable from a stall. Log a rough hashrate every
+                // HEARTBEAT_BATCHES batches.
+                let batches = BATCH_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if batches % HEARTBEAT_BATCHES == 0 {
+                    let secs = t0.elapsed().as_secs_f64().max(1e-6);
+                    let mhs = (BATCH_SIZE as f64 / secs) / 1e6;
+                    log_msg(&format!("ios: mining… {batches} batches, last batch {mhs:.2} MH/s, nonce@{nonce}"));
+                }
 
                 if let Some(winning_nonce) = found {
                     log_msg(&format!("ios: PoM winning nonce found: {}", winning_nonce));
