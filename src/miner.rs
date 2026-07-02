@@ -152,9 +152,27 @@ impl MinerManager {
             handles.append(&mut Self::launch_gpu_threads(
                 send_channel.clone(),
                 Arc::clone(&hashes_tried),
-                recv,
+                recv.clone(),
                 manager,
                 hashes_by_worker.clone(),
+            ));
+        }
+        // macOS has no GPU plugin, so no WorkerSpec is ever produced above. Launch
+        // the built-in Metal PoM worker (device 0) directly — mining is PoM-only,
+        // so launch_gpu_miner's PoM branch drives pom_gpu::mine and the worker's
+        // kHeavyHash stubs are never touched. set_mining_tier is already configured
+        // by the startup path (main.rs) before this runs.
+        #[cfg(target_os = "macos")]
+        {
+            let worker_hashes_tried = Arc::new(AtomicU64::new(0));
+            let spec: Box<dyn WorkerSpec> = Box::new(keryx_miner::metal_worker::MetalWorkerSpec);
+            hashes_by_worker.lock().unwrap().insert(spec.id(), worker_hashes_tried.clone());
+            handles.push(Self::launch_gpu_miner(
+                send_channel.clone(),
+                recv.clone(),
+                Arc::clone(&hashes_tried),
+                spec,
+                worker_hashes_tried,
             ));
         }
         Self {

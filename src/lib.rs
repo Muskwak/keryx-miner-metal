@@ -8,6 +8,11 @@ pub mod pom_gpu;
 pub mod slm;
 pub mod xoshiro256starstar;
 
+// Built-in Metal GPU worker: macOS has no CUDA/OpenCL plugin to supply GPU
+// workers, so the desktop binary uses this to launch its PoM mining thread.
+#[cfg(target_os = "macos")]
+pub mod metal_worker;
+
 #[cfg(target_os = "ios")]
 pub mod proto {
     #![allow(clippy::derive_partial_eq_without_eq)]

@@ -539,8 +539,15 @@ async fn main() -> Result<(), Error> {
     info!("Found plugins: {:?}", plugins);
     info!("Plugins found {} workers", worker_count);
     if worker_count == 0 && opt.num_threads.unwrap_or(0) == 0 {
-        error!("No workers specified");
-        return Err("No workers specified".into());
+        // macOS has no CUDA/OpenCL plugin, but MinerManager launches a built-in
+        // Metal PoM worker (device 0) regardless — so zero plugin workers is fine.
+        #[cfg(target_os = "macos")]
+        info!("No GPU plugin on macOS — using the built-in Metal PoM worker (device 0).");
+        #[cfg(not(target_os = "macos"))]
+        {
+            error!("No workers specified");
+            return Err("No workers specified".into());
+        }
     }
 
     let block_template_ctr = Arc::new(AtomicU16::new((thread_rng().next_u64() % 10_000u64) as u16));
