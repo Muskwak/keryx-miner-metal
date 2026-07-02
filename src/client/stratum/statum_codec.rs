@@ -47,6 +47,11 @@ pub(crate) enum MiningNotify {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub enum MiningSubmit {
+    // 6-element (PoM, post-fork): address, job_id, nonce, opoi_tag, ipfs_cid (or ""),
+    // pom_proof_hex. Fixed slot layout — CID stays at params[4] even when empty so the
+    // proof is always params[5]. The pool relays params[5] → RpcBlock.pomProof (no verify).
+    // Listed first: untagged matching is by arity, and a 6-element array is unambiguous.
+    MiningSubmitWithPom((String, String, String, String, String, String)),
     // 5-element: address, job_id, nonce, opoi_tag, ipfs_cid (Phase 2 full inference submit)
     MiningSubmitWithCID((String, String, String, String, String)),
     MiningSubmitWithTag((String, String, String, String)), // address, job_id, nonce, opoi_tag
