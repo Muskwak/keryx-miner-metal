@@ -84,10 +84,9 @@ fn ensure_mining_model_ready() -> bool {
     let Some(spec) = specs.first() else {
         return false;
     };
-    if !download_model(spec) {
+    let Some(gguf_path) = download_model(spec) else {
         return false;
-    }
-    let gguf_path = model_dir().join(format!("{}.gguf", spec.dir_name));
+    };
     pom_gpu::set_mining_tier(spec.model_id, gguf_path.to_string_lossy().into_owned());
     true
 }
@@ -105,41 +104,35 @@ pub extern "C" fn keryx_miner_initialize() -> bool {
 /// download would race two writers on the same path.
 static DOWNLOAD_LOCK: Mutex<()> = Mutex::new(());
 
-fn download_model(spec: &ModelSpec) -> bool {
+/// Downloads (with resume/retry, via `slm::download_file`) the model's GGUF
+/// from the same IPFS gateway the desktop miner uses, and returns its path
+/// once complete. Layout mirrors the desktop's `<dir>/model.gguf` + `.ok`
+/// sentinel, just rooted under the iOS sandbox's model_dir() instead of
+/// `<exe_dir>/models/`.
+fn download_model(spec: &ModelSpec) -> Option<std::path::PathBuf> {
     let _guard = DOWNLOAD_LOCK.lock();
-    let dir = model_dir();
+    let dir = model_dir().join(spec.dir_name);
+    let gguf_path = dir.join("model.gguf");
     let ok_file = dir.join(".ok");
-    if ok_file.exists() {
+    if ok_file.exists() && gguf_path.exists() {
         log_msg(&format!("ios: model '{}' already downloaded", spec.name));
-        return true;
+        return Some(gguf_path);
     }
-    let _ = std::fs::create_dir_all(&dir);
-
-    let model_url = format!("https://keryx-labs.com/models/{}", spec.dir_name);
-    log_msg(&format!("ios: downloading model '{}' from {} …", spec.name, model_url));
-    let response = match ureq::get(&model_url).call() {
-        Ok(r) => r,
-        Err(e) => {
-            log_msg(&format!("ios: model download failed: {e}"));
-            return false;
-        }
-    };
-    let len: usize = response.header("Content-Length").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let mut body: Vec<u8> = Vec::with_capacity(len);
-    let mut reader = response.into_reader();
-    if let Err(e) = std::io::copy(&mut reader, &mut body) {
-        log_msg(&format!("ios: model download read error: {e}"));
-        return false;
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log_msg(&format!("ios: model dir create error: {e}"));
+        return None;
     }
+    let _ = std::fs::remove_file(&ok_file); // clear stale flag before (re)downloading
 
-    let gguf_path = dir.join(format!("{}.gguf", spec.dir_name));
-    if let Err(e) = std::fs::write(&gguf_path, &body) {
-        log_msg(&format!("ios: model write error: {e}"));
-        return false;
+    let url = crate::slm::ipfs_url(spec.weight_cids[0]);
+    log_msg(&format!("ios: downloading model '{}' from {} …", spec.name, url));
+    if let Err(e) = crate::slm::download_file(&url, &gguf_path) {
+        log_msg(&format!("ios: model download failed: {e}"));
+        return None;
     }
     let _ = std::fs::write(&ok_file, b"ok");
-    log_msg(&format!("ios: model '{}' downloaded ({:.1} MB)", spec.name, body.len() as f64 / 1e6));
-    true
+    log_msg(&format!("ios: model '{}' downloaded", spec.name));
+    Some(gguf_path)
 }
 
 #[no_mangle]

@@ -151,7 +151,7 @@ pub fn gguf_path_for(spec: &ModelSpec) -> std::path::PathBuf {
 /// content is immutable (CID-addressed), so appending resumed bytes is always
 /// consistent, and an already-complete file (e.g. pre-staged with `wget -c`) is
 /// detected via a 416 response and left untouched instead of being re-downloaded.
-fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
+pub(crate) fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
     const MAX_ATTEMPTS: u32 = 240; // survives long gateway outages (~40 min of retries)
     const BACKOFF_SECS: u64 = 10;
     eprintln!("[keryx-miner] Downloading {} ...", url);
@@ -253,7 +253,7 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
     }
 }
 
-fn ipfs_url(cid: &str) -> String {
+pub(crate) fn ipfs_url(cid: &str) -> String {
     format!("{}/ipfs/{}", IPFS_GATEWAY, cid)
 }
 
