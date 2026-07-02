@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use log::info;
 
@@ -417,7 +417,7 @@ impl PomGpuMiner {
                 continue;
             }
             base_offsets.push(all_data.len() as u64);
-            all_data.extend_from_slice(bytes);
+            all_data.extend_from_slice(&bytes);
             prefix.push(prefix.last().unwrap() + chunks as u64);
         }
 
