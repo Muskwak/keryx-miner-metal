@@ -122,7 +122,7 @@ sha3 = { git = "https://github.com/elichai/hashes", branch = "cSHAKE" }
 
 [workspace]
 members = ["inference", "plugins/*"]
-default-members = [".", "plugins/cuda", "plugins/opencl"]
+default-members = ["."]
 
 # Vendored candle-kernels: the upstream MoE bf16 WMMA kernels only compile for
 # sm_80+, which would exclude Turing/Pascal (and thus all pre-Ampere miners) from
