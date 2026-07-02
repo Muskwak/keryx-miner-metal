@@ -16,8 +16,9 @@ fn log_msg(msg: &str) {
     if let Ok(mut log) = log.lock() {
         log.push_str(msg);
         log.push('\n');
-        if log.len() > 65536 {
-            *log = log.split_off(log.len() - 32768);
+        let len = log.len();
+        if len > 65536 {
+            *log = log.split_off(len - 32768);
         }
     }
 }
