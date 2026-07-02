@@ -8,6 +8,11 @@ pub mod pom_gpu;
 pub mod slm;
 pub mod xoshiro256starstar;
 
+// Stratum wire protocol (JSON-RPC line codec + message types). Lives in the lib
+// so both the desktop binary's StratumHandler and the iOS stratum client share
+// one implementation instead of duplicating the wire format.
+pub mod statum_codec;
+
 // Built-in Metal GPU worker: macOS has no CUDA/OpenCL plugin to supply GPU
 // workers, so the desktop binary uses this to launch its PoM mining thread.
 #[cfg(target_os = "macos")]

@@ -32,11 +32,11 @@ impl Display for ErrorCode {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub(crate) struct StratumError(pub(crate) ErrorCode, pub(crate) String, #[serde(default)] pub(crate) Option<Value>);
+pub struct StratumError(pub ErrorCode, pub String, #[serde(default)] pub Option<Value>);
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
-pub(crate) enum MiningNotify {
+pub enum MiningNotify {
     // 5-element: job_id, header_hash, timestamp, daa_score, task_json (AiRequest payload)
     MiningNotifyWithTask((String, [u64; 4], u64, u64, String)),
     MiningNotifyShortV2((String, [u64; 4], u64, u64)),
@@ -74,7 +74,7 @@ pub enum SetExtranonce {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "method", content = "params")]
-pub(crate) enum StratumCommand {
+pub enum StratumCommand {
     #[serde(rename = "mining.set_extranonce", alias = "set_extranonce")]
     SetExtranonce(SetExtranonce),
     #[serde(rename = "mining.set_difficulty")]
@@ -106,7 +106,7 @@ pub(crate) enum StratumCommand {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
-pub(crate) enum StratumResult {
+pub enum StratumResult {
     Plain(Option<bool>),
     Eth((bool, String)),
     Subscribe((Vec<(String, String)>, String, u32)),
@@ -114,25 +114,25 @@ pub(crate) enum StratumResult {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
-pub(crate) enum StratumLinePayload {
+pub enum StratumLinePayload {
     StratumCommand(StratumCommand),
     StratumResult { result: StratumResult },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub(crate) struct StratumLine {
-    pub(crate) id: Option<u32>,
+pub struct StratumLine {
+    pub id: Option<u32>,
     #[serde(flatten)]
-    pub(crate) payload: StratumLinePayload,
+    pub payload: StratumLinePayload,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) jsonrpc: Option<String>,
-    pub(crate) error: Option<StratumError>,
+    pub jsonrpc: Option<String>,
+    pub error: Option<StratumError>,
 }
 
 /// An error occurred while encoding or decoding a line.
 #[derive(Debug)]
 #[allow(dead_code)]
-pub(crate) enum NewLineJsonCodecError {
+pub enum NewLineJsonCodecError {
     JsonParseError(String),
     JsonEncodeError,
     LineSplitError,
@@ -158,7 +158,7 @@ impl From<(String, String)> for NewLineJsonCodecError {
     }
 }
 
-pub(crate) struct NewLineJsonCodec {
+pub struct NewLineJsonCodec {
     lines_codec: LinesCodec,
 }
 

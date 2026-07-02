@@ -8,10 +8,8 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
-mod statum_codec;
-
-use crate::client::stratum::statum_codec::{ErrorCode, MiningNotify, MiningSubmit, NewLineJsonCodecError, StratumLine};
-use crate::client::stratum::statum_codec::{
+use keryx_miner::statum_codec::{ErrorCode, MiningNotify, MiningSubmit, NewLineJsonCodecError, StratumLine};
+use keryx_miner::statum_codec::{
     MiningSubscribe, SetExtranonce, StratumCommand, StratumError, StratumLinePayload, StratumResult,
 };
 use crate::client::Client;
@@ -23,7 +21,7 @@ use futures_util::TryStreamExt;
 use log::{error, info, warn};
 use num::Float;
 use rand::{thread_rng, RngCore};
-use statum_codec::NewLineJsonCodec;
+use keryx_miner::statum_codec::NewLineJsonCodec;
 use std::sync::OnceLock;
 use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::Mutex;
