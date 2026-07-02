@@ -5,6 +5,8 @@
 #ifndef Bridge_h
 #define Bridge_h
 
+#include <stdbool.h>
+
 extern bool keryx_miner_connect(const char *address);
 extern bool keryx_miner_start(void);
 extern void keryx_miner_stop(void);
