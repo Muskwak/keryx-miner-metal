@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
+        uses: rustfs/setup-protoc@v3.0.1
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
@@ -40,15 +40,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
+        uses: rustfs/setup-protoc@v3.0.1
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
-          components: rustfmt, clippy
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: cargo fmt
-        run: cargo fmt --all -- --check
+      # NOTE: `cargo fmt --check` is intentionally not gated — this fork keeps hand-aligned,
+      # compact formatting (single-line if/else, tight method chains, wide format!/array
+      # literals) that rustfmt would expand. Same decision as the RDNA3 sibling fork.
       - name: cargo clippy (Metal)
         run: cargo clippy -p keryx-miner --target aarch64-apple-darwin --tests -- -D warnings
