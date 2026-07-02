@@ -2,15 +2,13 @@ use std::collections::HashMap;
 use std::num::Wrapping;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::sleep;
-use std::time::Duration;
+use std::thread::{self, sleep};
+use std::time::{Duration, Instant};
 
 use crate::{pow, watch, Error};
 use log::{error, info, warn};
 use rand::{thread_rng, RngCore};
 use tokio::sync::mpsc::Sender;
-use tokio::task::{self, JoinHandle};
-use tokio::time::MissedTickBehavior;
 
 use crate::pow::BlockSeed;
 use keryx_miner::{PluginManager, WorkerSpec};
@@ -93,7 +91,7 @@ pub struct MinerManager {
     handles: Vec<MinerHandler>,
     block_channel: watch::Sender<Option<WorkerCommand>>,
     send_channel: Sender<BlockSeed>,
-    logger_handle: JoinHandle<()>,
+    logger_stop: Arc<AtomicBool>,
     is_synced: bool,
     hashes_tried: Arc<AtomicU64>,
     hashes_by_worker: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
@@ -104,7 +102,9 @@ pub struct MinerManager {
 impl Drop for MinerManager {
     fn drop(&mut self) {
         info!("Closing miner");
-        self.logger_handle.abort();
+        // Signal the detached hashrate logger to exit on its next wake (it polls this flag). We
+        // don't join it — that would block shutdown up to LOG_RATE.
+        self.logger_stop.store(true, Ordering::Release);
         match self.block_channel.send(Some(WorkerCommand::Close)) {
             Ok(_) => {}
             Err(_) => warn!("All workers are already dead"),
@@ -180,15 +180,23 @@ impl MinerManager {
                 ));
             }
         }
+        let logger_stop = Arc::new(AtomicBool::new(false));
+        let logger_stop_spawn = Arc::clone(&logger_stop);
+        // Clone the counters the logger reads BEFORE the move-closure, so the originals stay
+        // available for the struct fields below. The hashrate logger runs on a dedicated std::thread
+        // (not a tokio task) so it never occupies one of the few async workers; it is detached and
+        // exits on `logger_stop` (set in Drop) — no join (that would block shutdown up to LOG_RATE).
+        let logger_hashes = Arc::clone(&hashes_tried);
+        let logger_by_worker = hashes_by_worker.clone();
+        let logger_challenge = Arc::clone(&opoi_challenge_active);
+        thread::spawn(move || {
+            Self::log_hashrate(logger_hashes, logger_by_worker, logger_challenge, logger_stop_spawn)
+        });
         Self {
             handles,
             block_channel: send,
             send_channel,
-            logger_handle: task::spawn(Self::log_hashrate(
-                Arc::clone(&hashes_tried),
-                hashes_by_worker.clone(),
-                Arc::clone(&opoi_challenge_active),
-            )),
+            logger_stop,
             is_synced: true,
             hashes_tried,
             current_state_id: AtomicUsize::new(0),
@@ -617,20 +625,22 @@ impl MinerManager {
         }).expect("failed to spawn cpu-miner thread")
     }
 
-    async fn log_hashrate(
+    fn log_hashrate(
         hashes_tried: Arc<AtomicU64>,
         hashes_by_worker: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
         opoi_challenge_active: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
     ) {
-        let mut ticker = tokio::time::interval(LOG_RATE);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut last_instant = ticker.tick().await;
+        let mut last_instant = Instant::now();
         // Consecutive all-zero ticks while NOT in an OPoI inference pause.
         let mut zero_streak: u32 = 0;
-        loop {
-            let now = ticker.tick().await;
-            let duration = (now - last_instant).as_secs_f64();
-            last_instant = now;
+        while !stop.load(Ordering::Acquire) {
+            thread::sleep(LOG_RATE);
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            let duration = last_instant.elapsed().as_secs_f64();
+            last_instant = Instant::now();
             // PoM model (re)load also intentionally pauses PoW — treat it like an inference pause.
             let challenge_active = opoi_challenge_active.load(Ordering::Relaxed)
                 || keryx_miner::pom_gpu::is_loading();
