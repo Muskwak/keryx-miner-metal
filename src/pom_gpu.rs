@@ -4,7 +4,6 @@
 //! On macOS (Apple Silicon) the PoM kernel runs via a custom Metal compute shader; on CUDA GPUs
 //! it runs via the original PTX kernel through candle's CUDA context.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
@@ -367,6 +366,7 @@ fn words4(b: &[u8; 32]) -> [u64; 4] {
 /// Parameter block matching the `PomParams` struct in the Metal shader. Packed via
 /// `encoder.set_bytes` so that each dispatch carries its own nonce range and target.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
+#[allow(non_snake_case)]
 #[repr(C)]
 struct PomParams {
     T: u32,
@@ -380,6 +380,7 @@ struct PomParams {
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
+#[allow(dead_code)]
 pub struct PomGpuMiner {
     device: metal::Device,
     queue: metal::CommandQueue,
