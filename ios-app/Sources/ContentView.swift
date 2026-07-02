@@ -1,0 +1,138 @@
+import SwiftUI
+
+// Rust FFI declarations
+@_silgen_name("keryx_miner_connect")
+func keryx_miner_connect(_ address: UnsafePointer<CChar>) -> Bool
+
+@_silgen_name("keryx_miner_start")
+func keryx_miner_start() -> Bool
+
+@_silgen_name("keryx_miner_stop")
+func keryx_miner_stop()
+
+@_silgen_name("keryx_miner_status")
+func keryx_miner_status() -> UnsafeMutablePointer<CChar>?
+
+@_silgen_name("keryx_miner_free_string")
+func keryx_miner_free_string(_ s: UnsafeMutablePointer<CChar>?)
+
+struct ContentView: View {
+    @State private var grpcAddress: String = "127.0.0.1:22110"
+    @State private var isMining: Bool = false
+    @State private var logLines: [String] = ["keryx-miner iOS — ready"]
+    @State private var statusTimer: Timer?
+
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 16) {
+                // gRPC address input
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("gRPC Address").font(.caption).foregroundColor(.secondary)
+                    TextField("host:port", text: $grpcAddress)
+                        .textFieldStyle(.roundedBorder)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+                        .disabled(isMining)
+                }
+                .padding(.horizontal)
+
+                // Start / Stop button
+                Button(action: {
+                    if isMining {
+                        stopMining()
+                    } else {
+                        startMining()
+                    }
+                }) {
+                    HStack {
+                        Image(systemName: isMining ? "stop.circle.fill" : "play.circle.fill")
+                        Text(isMining ? "Stop Mining" : "Start Mining")
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(isMining ? Color.red : Color.green)
+                    .foregroundColor(.white)
+                    .cornerRadius(10)
+                }
+                .padding(.horizontal)
+
+                // Log output
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Log").font(.caption).foregroundColor(.secondary)
+                    ScrollViewReader { scrollView in
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 1) {
+                                ForEach(Array(logLines.enumerated()), id: \.offset) { _, line in
+                                    Text(line)
+                                        .font(.system(.caption2, design: .monospaced))
+                                        .foregroundColor(.green)
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .background(Color.black.opacity(0.05))
+                        .cornerRadius(8)
+                    }
+                }
+                .padding(.horizontal)
+
+                Spacer()
+            }
+            .padding(.vertical)
+            .navigationTitle("Keryx Miner")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+
+    func startMining() {
+        let addr = grpcAddress.trimmingCharacters(in: .whitespaces)
+        guard !addr.isEmpty else {
+            logLines.append("ERROR: enter a gRPC address first")
+            return
+        }
+        let ok = addr.withCString { ptr in
+            keryx_miner_connect(ptr)
+        }
+        guard ok else {
+            logLines.append("ERROR: keryx_miner_connect failed")
+            return
+        }
+        guard keryx_miner_start() else {
+            logLines.append("ERROR: keryx_miner_start failed (already running?)")
+            return
+        }
+        isMining = true
+        logLines.append("Mining started — gRPC: \(addr)")
+
+        // Poll status every 2s
+        statusTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
+            pollStatus()
+        }
+    }
+
+    func stopMining() {
+        statusTimer?.invalidate()
+        statusTimer = nil
+        keryx_miner_stop()
+        isMining = false
+        logLines.append("Mining stopped")
+        pollStatus()
+    }
+
+    func pollStatus() {
+        guard let ptr = keryx_miner_status() else { return }
+        let json = String(cString: ptr)
+        keryx_miner_free_string(ptr)
+        if let data = json.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let running = obj["running"] as? Bool,
+           let nonces = obj["nonces_found"] as? UInt64,
+           let lines = obj["log_lines"] as? [String] {
+            isMining = running
+            logLines = Array(lines.suffix(20))
+            if nonces > 0 {
+                logLines.append("Nonces found: \(nonces)")
+            }
+        }
+    }
+}

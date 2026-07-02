@@ -12,7 +12,9 @@ use candle_transformers::models::quantized_llama::ModelWeights;
 use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2Weights;
 use candle_transformers::models::quantized_qwen3::ModelWeights as Qwen3Weights;
 use candle_transformers::models::quantized_gemma3::ModelWeights as Gemma3Weights;
+#[cfg(not(target_os = "ios"))]
 use crate::quantized_llama_split::ModelWeights as SplitWeights;
+#[cfg(not(target_os = "ios"))]
 use crate::quantized_qwen3_split::ModelWeights as Qwen3SplitWeights;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -96,9 +98,11 @@ enum ModelInner {
     Full { model: Llama, config: Config, cache_dtype: DType },
     Quantized(ModelWeights),
     /// GGUF llama-arch model via the split loader (single-device, for PoM zero-dup tensor sharing).
+    #[cfg(not(target_os = "ios"))]
     QuantizedSplit(SplitWeights),
     QuantizedQwen3(Qwen3Weights),
     /// GGUF Qwen3-arch dense model (Qwen3-32B) via the split loader (single-device, PoM zero-dup).
+    #[cfg(not(target_os = "ios"))]
     QuantizedQwen3Split(Qwen3SplitWeights),
     /// GGUF Gemma-3-arch model (Gemma-3-4B, baseline tier). Single-device only.
     QuantizedGemma3(Gemma3Weights),
@@ -428,6 +432,7 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
             // PoM zero-dup: load via the single-device split loader so the mining-tier model
             // exposes its quant tensors for in-place sharing with the possession walk. Otherwise
             // a regular single-device load.
+            #[cfg(not(target_os = "ios"))]
             let inner = if pom_force_split() && device.is_cuda() {
                 log::info!(
                     "SlmEngine: PoM zero-dup — loading '{}' (LLaMA) via single-device split loader",
@@ -437,6 +442,12 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                     .map_err(|e| anyhow!("load gguf weights (pom split): {}", e))?;
                 ModelInner::QuantizedSplit(model)
             } else {
+                let model = ModelWeights::from_gguf(content, &mut gguf_file, &device)
+                    .map_err(|e| anyhow!("load gguf weights: {}", e))?;
+                ModelInner::Quantized(model)
+            };
+            #[cfg(target_os = "ios")]
+            let inner = {
                 let model = ModelWeights::from_gguf(content, &mut gguf_file, &device)
                     .map_err(|e| anyhow!("load gguf weights: {}", e))?;
                 ModelInner::Quantized(model)
@@ -497,6 +508,7 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                 .map_err(|e| anyhow!("read gguf: {}", e))?;
             // PoM zero-dup: single-device split loader (exposes quant tensors for the walk),
             // otherwise a regular single-device load.
+            #[cfg(not(target_os = "ios"))]
             let inner = if pom_force_split() && device.is_cuda() {
                 log::info!(
                     "SlmEngine: PoM zero-dup — loading '{}' (Qwen3) via single-device split loader",
@@ -506,6 +518,12 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                     .map_err(|e| anyhow!("load qwen3 gguf weights (pom split): {}", e))?;
                 ModelInner::QuantizedQwen3Split(model)
             } else {
+                let model = Qwen3Weights::from_gguf(content, &mut gguf_file, &device)
+                    .map_err(|e| anyhow!("load qwen3 gguf weights: {}", e))?;
+                ModelInner::QuantizedQwen3(model)
+            };
+            #[cfg(target_os = "ios")]
+            let inner = {
                 let model = Qwen3Weights::from_gguf(content, &mut gguf_file, &device)
                     .map_err(|e| anyhow!("load qwen3 gguf weights: {}", e))?;
                 ModelInner::QuantizedQwen3(model)
@@ -666,6 +684,7 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
                 if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
             }
         }
+        #[cfg(not(target_os = "ios"))]
         ModelInner::QuantizedSplit(model) => {
             for step in 0..max_steps {
                 let (input_ids, pos) = if step == 0 {
@@ -731,6 +750,7 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
                 if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
             }
         }
+        #[cfg(not(target_os = "ios"))]
         ModelInner::QuantizedQwen3Split(model) => {
             // Same KV-cache reset as the non-split path (the split loader accumulates k/v too).
             model.clear_kv_cache();
@@ -899,12 +919,12 @@ pub enum GpuProbe {
 /// deliberately no CPU fallback — the OPoI models are far too large to run on CPU
 /// within the challenge deadline — so an unavailable accelerator is a hard error the
 /// callers report and refuse to mine on.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 fn new_inference_device() -> candle_core::Result<Device> {
     Device::new_cuda(0)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn new_inference_device() -> candle_core::Result<Device> {
     Device::new_metal(0)
 }
@@ -1122,7 +1142,9 @@ pub fn pom_shared(
         return None;
     }
     match &e.inner {
+        #[cfg(not(target_os = "ios"))]
         ModelInner::QuantizedQwen3Split(m) => Some((e.device.clone(), m.pom_quant_tensors())),
+        #[cfg(not(target_os = "ios"))]
         ModelInner::QuantizedSplit(m) => Some((e.device.clone(), m.pom_quant_tensors())),
         _ => None,
     }

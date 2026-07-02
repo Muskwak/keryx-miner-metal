@@ -10,14 +10,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=src/keccakf1600_x86-64.s");
     tonic_build::configure()
         .build_server(false)
-        // .type_attribute(".", "#[derive(Debug)]")
         .compile(
             &["proto/rpc.proto", "proto/p2p.proto", "proto/messages.proto"],
             &["proto"],
         )?;
-    // PoM mining kernel → PTX (loaded at runtime into candle's CUDA context). nvcc 12.2 (PATH).
-    println!("cargo:rerun-if-changed=cuda/pom_mine.cu");
-    {
+
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+
+    // PoM mining kernel → PTX (loaded at runtime into candle's CUDA context). nvcc 12.2.
+    // On macOS & iOS the Metal kernel (cuda/pom_mine.metal) is compiled at runtime via
+    // the Metal framework's in-process compiler; we only track changes for rebuild triggers.
+    let is_apple = target_os == "macos" || target_os == "ios";
+    if is_apple {
+        println!("cargo:rerun-if-changed=cuda/pom_mine.metal");
+    }
+    if !is_apple {
+        println!("cargo:rerun-if-changed=cuda/pom_mine.cu");
         let out_dir = env::var("OUT_DIR").unwrap();
         let nvcc = env::var("NVCC").ok().unwrap_or_else(|| {
             let pinned = "/home/slash/cuda-12.2/bin/nvcc";
@@ -32,8 +41,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert!(status.success(), "nvcc failed to compile cuda/pom_mine.cu");
     }
 
-    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    // Keccak-f1600 assembly: x86_64 only. On ARM64 (Apple Silicon) the Rust keccak crate
+    // is used instead (activated as a dependency in Cargo.toml for aarch64 macOS).
     if target_arch == "x86_64" && target_os != "windows" && target_os != "macos" {
         cc::Build::new().flag("-c").file("src/keccakf1600_x86-64.s").compile("libkeccak.a");
     }

@@ -8,6 +8,9 @@ readme = "README.md"
 description = "A fast CPU & GPU miner for Keryx"
 categories = ["command-line-utilities"]
 keywords = ["blockchain", "cli"]
+# On macOS: produce a binary (keryx-miner). On iOS: produce a static library
+# that gets linked into the native Swift app wrapper.
+crate-type = ["bin", "staticlib"]
 include = [
     "src/**/*.rs",
     "src/**/*.s",
@@ -35,7 +38,6 @@ log = "0.4"
 env_logger = "0.9"
 keccak = { version = "0.1", optional = true }
 parking = { package = "parking_lot", version = "0.12", optional = true }
-libloading = "0.7"
 tokio-util = {version = "0.7.0", features = ["codec"]}
 serde_json = "1.0"
 serde_repr = "0.1"
@@ -44,7 +46,6 @@ futures = "0.3.21"
 bytes = "1.1.0"
 async-trait = "0.1"
 num = "0.4"
-nix = "0.25"
 hex = "0.4"
 keryx-inference = { path = "inference" }
 secp256k1 = { version = "0.29.0", features = ["global-context"] }
@@ -63,6 +64,16 @@ flate2 = "1.0"
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+# libloading (dlopen/dlsym) is not available on iOS — static linking only.
+# Gate it behind the full-desktop feature so the iOS staticlib crate-type compiles.
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+libloading = "0.7"
+
+# nix (UNIX signal handling, pthread_kill) is macOS/Linux only, not available on iOS.
+# On iOS the miner runs as a single-threaded foreground app; no freeze handler needed.
+[target.'cfg(not(target_os = "ios"))'.dependencies.nix]
+version = "0.25"
+
 [features]
 default = ["parking_lot"]
 parking_lot = ["parking", "tokio/parking_lot"]
@@ -74,19 +85,28 @@ keccak = "0.1"
 kernel32-sys = "0.2"
 win32console = "0.1"
 
+# Keccak-f1600 for Apple Silicon: no assembly implementation for aarch64,
+# use the Rust keccak crate (same fallback as the `no-asm` feature and Windows).
+# macOS and iOS both use aarch64 Metal — same keccak fallback.
+[target.'cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")))'.dependencies]
+keccak = "0.1"
+
 # OPoI inference backend, chosen at build time. candle's `cuda` and `metal` features
-# are mutually exclusive backends: CUDA for NVIDIA rigs, Metal for Apple Silicon.
-# On macOS the vendored `candle-kernels` patch below is unused (it is CUDA-only) and
-# cargo will emit a harmless "patch not used" warning.
-[target.'cfg(not(target_os = "macos"))'.dependencies]
+# are mutually exclusive backends: CUDA for NVIDIA rigs, Metal for Apple Silicon
+# (both macOS and iOS). On macOS the vendored `candle-kernels` patch below is unused
+# (it is CUDA-only) and cargo will emit a harmless "patch not used" warning.
+[target.'cfg(all(not(target_os = "macos"), not(target_os = "ios")))'.dependencies]
 candle-core = { version = "0.9", features = ["cuda"] }
 candle-transformers = { version = "0.9", features = ["cuda"] }
 candle-nn = { version = "0.9", features = ["cuda"] }
 
-[target.'cfg(target_os = "macos")'.dependencies]
+# Metal backend: shared by macOS and iOS. Both platforms have native Metal.framework
+# and the same GPU family (Apple Silicon unified memory).
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 candle-core = { version = "0.9", features = ["metal"] }
 candle-transformers = { version = "0.9", features = ["metal"] }
 candle-nn = { version = "0.9", features = ["metal"] }
+metal = "0.27"
 
 [profile.release]
 lto = true

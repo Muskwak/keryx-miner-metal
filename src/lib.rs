@@ -1,29 +1,48 @@
 use clap::ArgMatches;
-use std::any::Any;
 use std::error::Error as StdError;
 
-pub mod inference;
+#[cfg(not(target_os = "ios"))]
+use std::any::Any;
+
 pub mod models;
 pub mod pom;
 pub mod pom_gpu;
-pub mod quantized_llama_split;
-pub mod quantized_qwen3_split;
 pub mod slm;
 pub mod xoshiro256starstar;
+
+#[cfg(not(target_os = "ios"))]
+pub mod inference;
+#[cfg(not(target_os = "ios"))]
+pub mod quantized_llama_split;
+#[cfg(not(target_os = "ios"))]
+pub mod quantized_qwen3_split;
+
+#[cfg(target_os = "ios")]
+pub mod ios;
+
+#[cfg(not(target_os = "ios"))]
 use libloading::{Library, Symbol};
 
 pub type Error = Box<dyn StdError + Send + Sync + 'static>;
 
+#[cfg(not(target_os = "ios"))]
 #[derive(Default)]
 pub struct PluginManager {
     plugins: Vec<Box<dyn Plugin>>,
     loaded_libraries: Vec<Library>,
 }
 
+#[cfg(target_os = "ios")]
+#[derive(Default)]
+pub struct PluginManager {
+    _private: (),
+}
+
 /**
  Plugin Manager class - allows inserting your own hashers
  Inspired by https://michael-f-bryan.github.io/rust-ffi-guide/dynamic_loading.html
 */
+#[cfg(not(target_os = "ios"))]
 impl PluginManager {
     pub fn new() -> Self {
         Self { plugins: Vec::new(), loaded_libraries: Vec::new() }
@@ -42,7 +61,7 @@ impl PluginManager {
             Err(e) => return Err((app, e.to_string().into())),
         };
 
-        self.loaded_libraries.push(lib); // Save library so it persists in memory
+        self.loaded_libraries.push(lib);
         let lib = self.loaded_libraries.last().unwrap();
 
         let constructor: Symbol<PluginCreate> = match lib.get(b"_plugin_create") {
@@ -72,9 +91,6 @@ impl PluginManager {
         Ok(specs)
     }
 
-    /**
-    Process the options for a plugin, and reports how many workers are available
-    */
     pub fn process_options(&mut self, matchs: &ArgMatches) -> Result<usize, Error> {
         let mut count = 0usize;
         self.plugins.iter_mut().for_each(|plugin| {
@@ -98,6 +114,26 @@ impl PluginManager {
     }
 }
 
+#[cfg(target_os = "ios")]
+impl PluginManager {
+    pub fn new() -> Self {
+        Self { _private: () }
+    }
+
+    pub fn build(&self) -> Result<Vec<Box<dyn WorkerSpec + 'static>>, Error> {
+        Ok(Vec::new())
+    }
+
+    pub fn process_options(&mut self, _matchs: &ArgMatches) -> Result<usize, Error> {
+        Ok(0)
+    }
+
+    pub fn has_specs(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
 pub trait Plugin: Any + Send + Sync {
     fn name(&self) -> &'static str;
     fn enabled(&self) -> bool;
@@ -105,28 +141,23 @@ pub trait Plugin: Any + Send + Sync {
     fn process_option(&mut self, matchs: &ArgMatches) -> Result<usize, Error>;
 }
 
+#[cfg(not(target_os = "ios"))]
 pub trait WorkerSpec: Any + Send + Sync {
-    /*type_: GPUWorkType,
-    opencl_platform: u16,
-    device_id: u32,
-    workload: f32,
-    is_absolute: bool*/
     fn id(&self) -> String;
     fn build(&self) -> Box<dyn Worker>;
 }
 
+#[cfg(not(target_os = "ios"))]
 pub trait Worker {
-    //fn new(device_id: u32, workload: f32, is_absolute: bool) -> Result<Self, Error>;
     fn id(&self) -> String;
     fn load_block_constants(&mut self, hash_header: &[u8; 72], matrix: &[[u16; 64]; 64], target: &[u64; 4]);
-
     fn calculate_hash(&mut self, nonces: Option<&Vec<u64>>, nonce_mask: u64, nonce_fixed: u64);
     fn sync(&self) -> Result<(), Error>;
-
     fn get_workload(&self) -> usize;
     fn copy_output_to(&mut self, nonces: &mut Vec<u64>) -> Result<(), Error>;
 }
 
+#[cfg(not(target_os = "ios"))]
 pub fn load_plugins<'help>(
     app: clap::App<'help>,
     paths: &[String],

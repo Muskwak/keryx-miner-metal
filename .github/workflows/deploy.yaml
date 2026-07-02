@@ -9,8 +9,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Build gnu-linux on ubuntu-18.04 and musl on ubuntu latest
-        os: [ ubuntu-18.04, windows-latest, macos-latest ]
+        os: [ ubuntu-18.04, windows-latest, macos-14 ]
         features: ["default", "kaspacuda/overclock "]
     name: Building, ${{ matrix.os }} ${{ matrix.features }}
     steps:
@@ -55,7 +54,6 @@ jobs:
 
       - name: Build on Linux GNU
         if: matrix.os == 'ubuntu-18.04'
-        # We're using musl to make the binaries statically linked and portable
         run: |
           cargo build --target=x86_64-unknown-linux-gnu --release --all --features ${{ matrix.features }}
           feature_name=${{ matrix.features }}
@@ -67,7 +65,6 @@ jobs:
           tar czvf ${asset_name}.tgz ${asset_name}
           echo "archive=${asset_name}.tgz" >> $GITHUB_ENV
           echo "asset_name=${asset_name}.tgz" >> $GITHUB_ENV
-
 
       - name: Build on Windows
         if: matrix.os == 'windows-latest'
@@ -84,17 +81,27 @@ jobs:
           echo "archive=${asset_name}.zip" >> $GITHUB_ENV
           echo "asset_name=${asset_name}.zip" >> $GITHUB_ENV
 
-      - name: Build on MacOS
-        if: matrix.os == 'macos-latest'
+      - name: Build on macOS (Intel)
+        if: matrix.os == 'macos-14' && matrix.features == 'default'
         run: |
-          cargo build --target=x86_64-apple-darwin --release -p kaspa-miner
-          asset_name="kaspa-miner-${{ github.event.release.tag_name }}-cpu-only-osx-amd64"
+          cargo build --target=x86_64-apple-darwin --release --bin keryx-miner
+          asset_name="keryx-miner-${{ github.event.release.tag_name }}-cpu-only-osx-amd64"
           mkdir ${asset_name}
-          mv ./target/x86_64-apple-darwin/release/kaspa-miner ${asset_name}/${asset_name}
+          mv ./target/x86_64-apple-darwin/release/keryx-miner ${asset_name}/${asset_name}
           tar czvf ${asset_name}.tgz ${asset_name}
           echo "archive=${asset_name}.tgz" >> $GITHUB_ENV
           echo "asset_name=${asset_name}.tgz" >> $GITHUB_ENV
 
+      - name: Build on macOS (Apple Silicon)
+        if: matrix.os == 'macos-14' && matrix.features == 'default'
+        run: |
+          cargo build --target=aarch64-apple-darwin --release --bin keryx-miner
+          asset_name="keryx-miner-${{ github.event.release.tag_name }}-apple-silicon"
+          mkdir ${asset_name}
+          mv ./target/aarch64-apple-darwin/release/keryx-miner ${asset_name}/${asset_name}
+          tar czvf ${asset_name}.tgz ${asset_name}
+          echo "archive=${asset_name}.tgz" >> $GITHUB_ENV
+          echo "asset_name=${asset_name}.tgz" >> $GITHUB_ENV
 
       - name: Upload release asset
         uses: actions/upload-release-asset@v1
@@ -111,7 +118,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Build gnu-linux on ubuntu-18.04 and musl on ubuntu latest
         itegration: [ hiveos ]
     name: Integrating, ${{ matrix.itegration }}
     steps:

@@ -1,0 +1,172 @@
+name: Build Apple (macOS + iOS)
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    name: macOS Binary
+    runs-on: macos-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v1
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-apple-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build keryx-miner (macOS aarch64)
+        run: cargo build --release --bin keryx-miner
+
+      - name: Strip binary
+        run: strip target/release/keryx-miner
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: keryx-miner-macos-arm64
+          path: target/release/keryx-miner
+
+  build-ios-lib:
+    name: iOS Static Library
+    runs-on: macos-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v1
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Add iOS target
+        run: rustup target add aarch64-apple-ios
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-ios-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build iOS static library
+        run: cargo build --release --target aarch64-apple-ios --lib
+
+      - name: Upload iOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: keryx-miner-ios-lib
+          path: target/aarch64-apple-ios/release/libkeryx_miner.a
+
+  build-ios-app:
+    name: iOS App (.ipa)
+    runs-on: macos-latest
+    needs: build-ios-lib
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Download iOS library artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: keryx-miner-ios-lib
+          path: target/aarch64-apple-ios/release/
+
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Build iOS app
+        run: |
+          cd ios-app
+          xcodegen generate
+          xcodebuild \
+            -project keryx-ios.xcodeproj \
+            -scheme keryx-ios \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath ./build/keryx-ios.xcarchive \
+            archive \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Create unsigned .ipa
+        run: |
+          cd ios-app
+          mkdir -p Payload
+          cp -r build/keryx-ios.xcarchive/Products/Applications/keryx-ios.app Payload/
+          zip -r keryx-ios-unsigned.ipa Payload/
+          rm -rf Payload
+
+      - name: Upload iOS .ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: keryx-miner-ios-unsigned-ipa
+          path: ios-app/keryx-ios-unsigned.ipa
+
+  test-macos:
+    name: Tests (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v1
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-test-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run tests
+        run: cargo test --release -- --skip heavy --skip gpu

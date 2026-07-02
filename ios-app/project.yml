@@ -1,0 +1,25 @@
+name: keryx-ios
+options:
+  bundleIdPrefix: com.keryx.miner
+  deploymentTarget:
+    iOS: "16.0"
+settings:
+  base:
+    SWIFT_VERSION: 5.9
+    TARGETED_DEVICE_FAMILY: "1"
+    INFOPLIST_FILE: Info.plist
+targets:
+  keryx-ios:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.keryx.miner.ios
+        INFOPLIST_FILE: Info.plist
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Bridge.h
+        OTHER_LINKER_FLAGS: -L$(SRCROOT)/../target/aarch64-apple-ios/release -lkeryx_miner -lresolv
+        LIBRARY_SEARCH_PATHS: $(SRCROOT)/../target/aarch64-apple-ios/release
+        CLANG_ENABLE_MODULES: YES
+    dependencies: []
