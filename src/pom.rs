@@ -37,7 +37,8 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()
         return Ok(());
     }
 }
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub const CHUNK_WORDS: usize = 4; // 32 B chunk
 const SEED_SALT: u64 = 0x4B65727978500; // "KeryxP"
@@ -875,17 +876,31 @@ fn finalize_checkpoint_upper(
 /// MAINNET_PARAMS.pom_activation = new(37_780_000).
 pub const POM_ACTIVATION_DAA: u64 = 37_780_000;
 
-/// The resident tier weight index + tier id, installed once at startup when PoM is enabled.
-static POM_INDEX: OnceLock<(WeightIndex, u8)> = OnceLock::new();
+/// Per-tier resident possession indices, built lazily when PoM activates. A heterogeneous rig can
+/// mine several tiers at once (one per GPU), so the index is keyed by tier rather than a single
+/// process-wide slot. Each tier's index is built once and shared (`Arc`) across every GPU on it.
+static POM_INDICES: OnceLock<Mutex<HashMap<u8, Arc<WeightIndex>>>> = OnceLock::new();
 
-/// Install the possession index (built from the resident model) and its tier. Call once.
-pub fn set_index(index: WeightIndex, tier: u8) {
-    let _ = POM_INDEX.set((index, tier));
+fn pom_indices() -> &'static Mutex<HashMap<u8, Arc<WeightIndex>>> {
+    POM_INDICES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The active possession index + tier, if installed.
-pub fn active_index() -> Option<&'static (WeightIndex, u8)> {
-    POM_INDEX.get()
+/// Install a tier's possession index (built from that tier's resident model). Idempotent per tier.
+pub fn set_index(tier: u8, index: WeightIndex) {
+    if let Ok(mut g) = pom_indices().lock() {
+        g.insert(tier, Arc::new(index));
+    }
+}
+
+/// The possession index for a specific tier, if built.
+pub fn active_index_for_tier(tier: u8) -> Option<Arc<WeightIndex>> {
+    pom_indices().lock().ok().and_then(|g| g.get(&tier).cloned())
+}
+
+/// Any built index — the lowest tier present. Used by the CPU/fallback walk, which has no per-device
+/// tier assignment, and by "is any index ready" checks.
+pub fn any_active_index() -> Option<(u8, Arc<WeightIndex>)> {
+    pom_indices().lock().ok().and_then(|g| g.iter().min_by_key(|(t, _)| **t).map(|(t, i)| (*t, i.clone())))
 }
 
 #[cfg(test)]

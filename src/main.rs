@@ -182,51 +182,91 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
     }
 }
 
-/// Total VRAM (MB) of the CUDA device the miner mines/serves on (CUDA device 0), or None when no
-/// CUDA device is present (CPU-only / AMD hosts). Sourced from the CUDA driver so it matches the
-/// `device_id` candle/PoM actually load onto — unlike nvidia-smi, whose PCI ordering can disagree
-/// with CUDA's `FASTEST_FIRST` default on a mixed rig and report a different card's VRAM.
-fn query_vram_mb() -> Option<u64> {
-    keryx_miner::pom_gpu::query_all_gpus_vram()
-        .into_iter()
-        .find(|(id, _)| *id == 0)
-        .map(|(_, mb)| mb)
+/// Per-tier VRAM floor (MB) for **auto-assignment** — the practical minimum to load that tier's
+/// model (Q4 weights + KV cache + CUDA workspace). Distinct from `ModelSpec.min_vram_mb`, which is 0
+/// for the smallest tiers (never gated out of `ai:cap`) and so can't rank tier 0 vs 1 by VRAM.
+/// Largest tier first, so a device picks the biggest tier it can hold.
+const POM_TIER_LADDER: &[(keryx_miner::models::Tier, u64)] = &[
+    (keryx_miner::models::Tier::VeryHigh, 30_000),
+    (keryx_miner::models::Tier::High, 24_000),
+    (keryx_miner::models::Tier::Default, 8_000),
+    (keryx_miner::models::Tier::Light, 5_000),
+    (keryx_miner::models::Tier::VeryLight, 2_000),
+];
+
+/// Ordinal rank of a tier (VeryLight=0 … VeryHigh=4), for the "≤ ceiling" comparison.
+fn tier_rank(t: keryx_miner::models::Tier) -> u8 {
+    use keryx_miner::models::Tier::*;
+    match t {
+        VeryLight => 0,
+        Light => 1,
+        Default => 2,
+        High => 3,
+        VeryHigh => 4,
+    }
 }
 
-/// OPoI capability gate (layer A): drop the models this machine cannot actually
-/// serve on CUDA device 0, so the `ai:cap` announcement never promises a model the miner
-/// would fail to load. Skipped when no CUDA device is present (CPU-fallback setups
-/// keep working).
-fn filter_specs_by_vram(
-    specs: &'static [&'static keryx_miner::models::ModelSpec],
-) -> &'static [&'static keryx_miner::models::ModelSpec] {
-    let Some(gpu0_mb) = query_vram_mb() else {
-        log::warn!("Cannot query GPU VRAM (CUDA driver) — skipping the model capability gate.");
-        return specs;
-    };
-    let kept: Vec<&'static keryx_miner::models::ModelSpec> = specs
+/// Assign each CUDA device the highest PoM tier that (a) is ≤ the `ceiling` flag and (b) fits its
+/// VRAM — so a heterogeneous rig mines a different tier per GPU instead of the lowest common
+/// denominator, small cards downgrade instead of failing, and big cards are not pushed past the
+/// user's ceiling. VRAM is CUDA-driver-sourced (`query_all_gpus_vram`), so `device_id`s match the
+/// devices the walk loads onto. Empty when PoM is disabled on this network; a single device-0 entry
+/// (highest tier ≤ ceiling) when no CUDA device is enumerated, so the fallback walk still has a tier.
+fn assign_pom_tiers(ceiling: keryx_miner::models::Tier) -> Vec<(u32, &'static keryx_miner::models::ModelSpec)> {
+    if keryx_miner::pom::POM_ACTIVATION_DAA == u64::MAX {
+        return Vec::new(); // PoM disabled on this network — serve only, don't mine possession.
+    }
+    let ceiling_rank = tier_rank(ceiling);
+    // PoM model + assignment floor for each tier ≤ ceiling, largest first.
+    let candidates: Vec<(u64, &'static keryx_miner::models::ModelSpec)> = POM_TIER_LADDER
         .iter()
-        .copied()
-        .filter(|spec| {
-            if spec.min_vram_mb <= gpu0_mb {
-                true
-            } else {
-                log::warn!(
-                    "✗  '{}' needs ≥{} MB VRAM but only {} MB on CUDA device 0 — model NOT announced (ai:cap) and not downloaded.",
-                    spec.name,
-                    spec.min_vram_mb,
-                    gpu0_mb,
-                );
-                false
-            }
+        .filter(|(t, _)| tier_rank(*t) <= ceiling_rank)
+        .filter_map(|(t, floor)| {
+            keryx_miner::models::specs_for(keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA, *t)
+                .iter()
+                .copied()
+                .find(|s| keryx_miner::models::is_pom_model(&s.model_id))
+                .map(|s| (*floor, s))
         })
         .collect();
-    if kept.len() == specs.len() {
-        specs
-    } else {
-        // Leaked once at startup to keep the &'static API of init_supported.
-        Box::leak(kept.into_boxed_slice())
+
+    let pick = |vram_mb: u64| -> Option<&'static keryx_miner::models::ModelSpec> {
+        candidates.iter().copied().find(|(floor, _)| *floor <= vram_mb).map(|(_, s)| s)
+    };
+
+    let devices = keryx_miner::pom_gpu::query_all_gpus_vram();
+    if devices.is_empty() {
+        log::warn!("No CUDA device enumerated for PoM tier assignment — assigning the ceiling tier to device 0 (fallback).");
+        return candidates.first().map(|(_, s)| vec![(0u32, *s)]).unwrap_or_default();
     }
+    let mut out = Vec::with_capacity(devices.len());
+    for (id, vram_mb) in devices {
+        match pick(vram_mb) {
+            Some(spec) => out.push((id as u32, spec)),
+            None => log::warn!("PoM: GPU {} ({} MB VRAM) fits no tier ≤ the ceiling — it will not mine PoM.", id, vram_mb),
+        }
+    }
+    out
+}
+
+/// The served lineup (drives `ai:cap` + prefetch) = the distinct models across all GPU assignments.
+/// Falls back to the `ceiling` tier's model when nothing was assigned (PoM disabled, or every GPU too
+/// small), so `ai:cap`/inference still have a lineup.
+fn lineup_from_assignments(
+    assignments: &[(u32, &'static keryx_miner::models::ModelSpec)],
+    ceiling: keryx_miner::models::Tier,
+) -> &'static [&'static keryx_miner::models::ModelSpec] {
+    let mut union: Vec<&'static keryx_miner::models::ModelSpec> = Vec::new();
+    for (_, spec) in assignments {
+        if !union.iter().any(|s| s.model_id == spec.model_id) {
+            union.push(*spec);
+        }
+    }
+    if union.is_empty() {
+        return keryx_miner::models::specs_for(keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA, ceiling);
+    }
+    // Leaked once at startup to keep the &'static API of init_supported / prefetch.
+    Box::leak(union.into_boxed_slice())
 }
 
 async fn get_client(
@@ -471,21 +511,12 @@ async fn run() -> Result<(), Error> {
     // pulls the new Q2_K_L straight away instead of paying two ~27 GB downloads + a hot-swap. A
     // tier whose post-H2 model isn't consensus-valid yet (very-light, very-high) simply produces no
     // block until H2 (its `pom_tier_index` is None pre-H2) — it idles, no wasted bandwidth.
-    let specs_v2 = filter_specs_by_vram(
-        keryx_miner::models::specs_for(keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA, tier),
-    );
-    // PoM: pick the highest tier this miner serves that has a pinned R_T (the model it will
-    // mine under possession). Captured before `specs_v2` is consumed; the index is built after
-    // prefetch (below). `&'static ModelSpec` is Copy so this survives the moves.
-    let pom_spec = if keryx_miner::pom::POM_ACTIVATION_DAA != u64::MAX {
-        specs_v2
-            .iter()
-            .copied()
-            .filter(|s| keryx_miner::models::is_pom_model(&s.model_id))
-            .max_by_key(|s| s.min_vram_mb)
-    } else {
-        None
-    };
+    // Per-GPU PoM assignment: each CUDA device mines the highest tier ≤ the flag ceiling that its
+    // VRAM holds (small cards downgrade instead of failing; big cards are not pushed past the
+    // ceiling). VRAM is CUDA-driver-sourced so device_ids match the devices the walk loads onto.
+    let pom_assignments = assign_pom_tiers(tier);
+    // The served lineup (ai:cap + prefetch) = the union of distinct models across all GPUs.
+    let specs_v2 = lineup_from_assignments(&pom_assignments, tier);
     // Serve the uncensored lineup from the start. set_v2_lineup keeps the readiness-gated
     // crossing swap a consistent no-op (it would swap v2 -> v2).
     keryx_miner::slm::set_v2_lineup(specs_v2);
@@ -511,15 +542,17 @@ async fn run() -> Result<(), Error> {
     // pre-PoM legacy phase the GPU + host stay free for the legacy lineup (mining + inference start
     // immediately). The possession index AND the GPU walk are built by the mining loop the first
     // time PoM is active (DAA >= POM_ACTIVATION_DAA). Here we only record cheap config.
-    if let Some(spec) = pom_spec {
-        let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
-        // Force the single-device split loader so the mining tier exposes its quant tensors for
-        // zero-dup sharing. The PoM tier *index* is computed per block from the block DAA (it
-        // shifts at the very-light H2 hardfork), so it is not recorded here — only the model.
+    if !pom_assignments.is_empty() {
+        // Force the split loader so a mining tier exposes its quant tensors for zero-dup sharing on
+        // the inference GPU. The tier *index* is computed per block from the block DAA (it shifts at
+        // the very-light H2 hardfork), so only the model is recorded here.
         keryx_miner::slm::set_pom_force_split(true);
-        keryx_miner::pom_gpu::set_mining_tier(spec.model_id, gpath);
-        info!("PoM: configured to mine {} under possession; index + GPU walk load lazily when PoM activates (DAA {}).",
-            spec.dir_name, keryx_miner::pom::POM_ACTIVATION_DAA);
+        for (device_id, spec) in &pom_assignments {
+            let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
+            keryx_miner::pom_gpu::set_mining_tier(*device_id, spec.model_id, gpath);
+            info!("PoM: GPU {} → {} (index + GPU walk load lazily when PoM activates, DAA {}).",
+                device_id, spec.dir_name, keryx_miner::pom::POM_ACTIVATION_DAA);
+        }
     }
 
     // Verify GPU inference works before mining. OPoI challenges are mandatory, so a miner

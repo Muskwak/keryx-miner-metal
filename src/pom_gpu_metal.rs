@@ -19,7 +19,7 @@
 //! `vendor/candle-core/src/quantized/mod.rs`. Cloning a `Buffer` just bumps the objc2 retain
 //! count — no data is copied.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -338,15 +338,86 @@ pub fn mine(
     miner.mine(pre_pow_hash, timestamp, target_le, start, batch).ok().flatten()
 }
 
-static MINING_TIER: OnceLock<([u8; 32], String)> = OnceLock::new();
+/// Per-device mining-tier identity for rebuilds: `device_id -> (model_id, gguf_path)`. Apple Silicon
+/// is single-GPU (device 0), but the map is keyed by device to stay signature-compatible with the
+/// CUDA path (where a heterogeneous rig mines a different tier per GPU), so main.rs/miner.rs/slm.rs
+/// call the same free functions on both backends.
+static MINING_TIERS: OnceLock<Mutex<HashMap<u32, ([u8; 32], String)>>> = OnceLock::new();
 
-pub fn set_mining_tier(model_id: [u8; 32], gguf_path: String) {
-    let _ = MINING_TIER.set((model_id, gguf_path));
+fn mining_tiers() -> &'static Mutex<HashMap<u32, ([u8; 32], String)>> {
+    MINING_TIERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub fn current_tier(daa: u64) -> Option<u8> {
-    let (model_id, _) = MINING_TIER.get()?;
-    crate::models::pom_tier_index(model_id, daa)
+/// Record a device's mining tier so its miner can be rebuilt after an inference swapped the model away.
+pub fn set_mining_tier(device_id: u32, model_id: [u8; 32], gguf_path: String) {
+    if let Ok(mut g) = mining_tiers().lock() {
+        g.insert(device_id, (model_id, gguf_path));
+    }
+}
+
+/// PoM tier index of a device's mining model at a given block DAA. Recomputed per block (not frozen at
+/// index-build time) so the tier reindexing at the very-light hardfork (H2) is applied at the exact
+/// boundary rather than from a stale build-time value.
+pub fn current_tier(device_id: u32, daa: u64) -> Option<u8> {
+    let model_id = mining_tiers().lock().ok()?.get(&device_id).map(|(id, _)| *id)?;
+    crate::models::pom_tier_index(&model_id, daa)
+}
+
+/// The Metal device that mines `model_id` (from the per-device tier assignment), if any — the Metal
+/// peer of the CUDA `device_for_model`. Inference is routed to the device already holding the model so
+/// only that device pauses mining. Returns the lowest matching `device_id`; `None` when nothing mines
+/// it. On Apple Silicon this is device 0 whenever a tier is assigned.
+pub fn device_for_model(model_id: &[u8; 32]) -> Option<u32> {
+    let g = mining_tiers().lock().ok()?;
+    g.iter().filter(|(_, (id, _))| id == model_id).map(|(dev, _)| *dev).min()
+}
+
+/// Models that failed to load on a given device: `(device_id, model_id)`. Once banlisted, that device
+/// never retries that model (avoids a hot-spin reloading a model that doesn't fit); the OOM handler
+/// downgrades to a smaller downloaded tier instead. On Apple Silicon an "OOM" is a unified-memory
+/// allocation failure — real on a small Mac loading a large tier alongside the resident inference engine.
+static OOM_BANLIST: OnceLock<Mutex<HashSet<(u32, [u8; 32])>>> = OnceLock::new();
+
+fn oom_banlist() -> &'static Mutex<HashSet<(u32, [u8; 32])>> {
+    OOM_BANLIST.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn is_oom_banlisted(device_id: u32, model_id: &[u8; 32]) -> bool {
+    oom_banlist().lock().map(|g| g.contains(&(device_id, *model_id))).unwrap_or(false)
+}
+
+fn oom_banlist_add(device_id: u32, model_id: [u8; 32]) {
+    if let Ok(mut g) = oom_banlist().lock() {
+        g.insert((device_id, model_id));
+    }
+}
+
+/// After a device fails to load its assigned tier (OOM), reassign it to the largest
+/// **already-downloaded** PoM model strictly smaller than the failed one not itself banlisted here — so
+/// a Mac whose unified-memory budget was optimistic mines a smaller tier instead of idling. The Metal
+/// peer of the CUDA `downgrade_after_oom`. Returns true if a downgrade was applied; no extra prefetch
+/// is needed since the candidate set is the already-downloaded served union.
+fn downgrade_after_oom(device_id: u32, failed_model: &[u8; 32], daa: u64) -> bool {
+    let Some(failed_tier) = crate::models::pom_tier_index(failed_model, daa) else {
+        return false;
+    };
+    let pick = crate::slm::served_pom_specs()
+        .into_iter()
+        .filter_map(|s| crate::models::pom_tier_index(&s.model_id, daa).map(|t| (t, s)))
+        .filter(|(t, s)| *t < failed_tier && !is_oom_banlisted(device_id, &s.model_id))
+        .max_by_key(|(t, _)| *t);
+    match pick {
+        Some((tier, spec)) => {
+            let gguf = crate::slm::gguf_path_for(spec).to_string_lossy().into_owned();
+            info!("PoM Metal[gpu{}]: OOM on tier {} — downgrading to tier {} ({}).", device_id, failed_tier, tier, spec.name);
+            set_mining_tier(device_id, spec.model_id, gguf);
+            true
+        }
+        None => {
+            log::warn!("PoM Metal[gpu{}]: OOM and no smaller downloaded tier available — this device will not mine PoM (lower the tier flag or add RAM).", device_id);
+            false
+        }
+    }
 }
 
 pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
@@ -360,47 +431,67 @@ pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
 }
 
 fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
-    let (model_id, gguf) = match MINING_TIER.get() {
+    let (model_id, gguf) = match mining_tiers().lock().ok().and_then(|g| g.get(&device_id).cloned()) {
         Some(x) => x,
         None => return false,
     };
-    if crate::pom::active_index().is_none() {
+    // This device's tier at the current block DAA (recomputed per block, H2-gated).
+    let tier = match crate::models::pom_tier_index(&model_id, daa) {
+        Some(t) => t,
+        None => return false,
+    };
+    if is_oom_banlisted(device_id, &model_id) {
+        return false; // this model OOM'd on this device before — don't retry (avoids a hot reload spin).
+    }
+    // Build THIS tier's possession index once (host, heavy) — deferred from boot so the pre-PoM legacy
+    // phase starts immediately, and keyed by tier so a rig mining several tiers builds one index per
+    // distinct tier (shared across every device on that tier).
+    if crate::pom::active_index_for_tier(tier).is_none() {
         let _guard = match index_build_lock().lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        if crate::pom::active_index().is_none() {
-            let tier = match crate::models::pom_tier_index(model_id, daa) {
-                Some(t) => t,
-                None => return false,
-            };
-            info!("PoM Metal: building shared host weight index (gpu{}) — this can take a while…", device_id);
-            match crate::pom::WeightIndex::build_from_gguf(gguf) {
+        if crate::pom::active_index_for_tier(tier).is_none() {
+            info!("PoM Metal: building host weight index for tier {} (gpu{}) — this can take a while…", tier, device_id);
+            match crate::pom::WeightIndex::build_from_gguf(&gguf) {
                 Ok(idx) => {
-                    info!("PoM Metal: shared host index ready — N={} chunks", idx.n_chunks);
-                    crate::pom::set_index(idx, tier);
+                    info!("PoM Metal: tier {} host index ready — N={} chunks", tier, idx.n_chunks);
+                    crate::pom::set_index(tier, idx);
                 }
                 Err(e) => {
-                    log::error!("PoM Metal: shared host index build failed on gpu{}: {}", device_id, e);
+                    log::error!("PoM Metal: host index build failed for tier {} on gpu{}: {}", tier, device_id, e);
                     return false;
                 }
             }
         }
     }
-    let gm = match PomGpuMiner::load(gguf, device_id as usize) {
-        Ok(m) => m,
-        Err(e) => {
-            log::error!("PoM Metal[gpu{}]: load failed: {}", device_id, e);
+    // Load the Metal miner (a bindless walk over candle's resident MTLBuffers). A unified-memory
+    // allocation failure surfaces as an Err — or, defensively, a panic; catch both so the OOM handler
+    // can banlist + downgrade instead of crashing the mining thread or hot-spinning on a model that
+    // doesn't fit this device.
+    let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PomGpuMiner::load(&gguf, device_id as usize)
+    }));
+    let gm = match loaded {
+        Ok(Ok(gm)) => gm,
+        Ok(Err(e)) => {
+            log::error!("PoM Metal[gpu{}]: device miner build failed: {} — banlisting this model and downgrading.", device_id, e);
+            oom_banlist_add(device_id, model_id);
+            downgrade_after_oom(device_id, &model_id, daa);
+            return false;
+        }
+        Err(_) => {
+            log::error!("PoM Metal[gpu{}]: device miner load panicked (likely OOM) — banlisting this model and downgrading.", device_id);
+            oom_banlist_add(device_id, model_id);
+            downgrade_after_oom(device_id, &model_id, daa);
             return false;
         }
     };
     let n = gm.n_chunks();
-    if let Some((idx, _)) = crate::pom::active_index() {
+    // N-guard: the gather must match the host index, else blocks would be rejected.
+    if let Some(idx) = crate::pom::active_index_for_tier(tier) {
         if n != idx.n_chunks {
-            log::error!(
-                "PoM Metal[gpu{}]: resident N={} != shared index N={} — refusing to mine",
-                device_id, n, idx.n_chunks
-            );
+            log::error!("PoM Metal[gpu{}]: resident N={} != tier {} index N={} — refusing to mine", device_id, n, tier, idx.n_chunks);
             return false;
         }
     }

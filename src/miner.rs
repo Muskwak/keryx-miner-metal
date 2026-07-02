@@ -335,10 +335,9 @@ impl MinerManager {
                         worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
                         if let Some(nonce) = found {
                             let built = state.as_ref().and_then(|s| {
-                                keryx_miner::pom::active_index().and_then(|(idx, _)| {
-                                    let tier = keryx_miner::pom_gpu::current_tier(s.daa_score)?;
-                                    s.generate_block_if_pom(nonce, idx, tier)
-                                })
+                                let tier = keryx_miner::pom_gpu::current_tier(worker_device_id, s.daa_score)?;
+                                let idx = keryx_miner::pom::active_index_for_tier(tier)?;
+                                s.generate_block_if_pom(nonce, idx.as_ref(), tier)
                             });
                             if let Some(block_seed) = built {
                                 match send_channel.blocking_send(block_seed.clone()) {
@@ -509,10 +508,9 @@ impl MinerManager {
                         // and checks pow_value <= target, so a Metal/host byte divergence yields None
                         // (no bad block is ever submitted) rather than an invalid block.
                         let built = state.as_ref().and_then(|s| {
-                            keryx_miner::pom::active_index().and_then(|(idx, _)| {
-                                let tier = keryx_miner::pom_gpu::current_tier(s.daa_score)?;
-                                s.generate_block_if_pom(nonce, idx, tier)
-                            })
+                            let tier = keryx_miner::pom_gpu::current_tier(DEVICE_ID, s.daa_score)?;
+                            let idx = keryx_miner::pom::active_index_for_tier(tier)?;
+                            s.generate_block_if_pom(nonce, idx.as_ref(), tier)
                         });
                         if let Some(block_seed) = built {
                             match send_channel.blocking_send(block_seed.clone()) {
@@ -584,9 +582,10 @@ impl MinerManager {
 
                     // PoM possession path (CPU) once active; else legacy kHeavyHash.
                     let found = if state_ref.daa_score >= keryx_miner::pom::POM_ACTIVATION_DAA {
-                        keryx_miner::pom::active_index().and_then(|(idx, _)| {
-                            let tier = keryx_miner::pom_gpu::current_tier(state_ref.daa_score)?;
-                            state_ref.generate_block_if_pom(nonce.0, idx, tier)
+                        // The CPU/fallback walk has no per-device tier assignment — mine whichever
+                        // tier's index is built (lowest present).
+                        keryx_miner::pom::any_active_index().and_then(|(tier, idx)| {
+                            state_ref.generate_block_if_pom(nonce.0, idx.as_ref(), tier)
                         })
                     } else {
                         state_ref.generate_block_if_pow(nonce.0)

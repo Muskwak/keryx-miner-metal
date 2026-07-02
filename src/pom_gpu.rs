@@ -9,7 +9,7 @@
 //! The kernel's seed/pow folds are byte-identical to `pom::pom_block_seed`/`pom::pom_pow_value`,
 //! so a nonce found here builds a `PomProof` (host) the node accepts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -277,12 +277,20 @@ pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: 
     miner.mine(pre_pow_hash, timestamp, target_le, start, batch).ok().flatten()
 }
 
-/// Mining-tier identity for rebuilds: (model_id, gguf_path). Set once at startup.
-static MINING_TIER: OnceLock<([u8; 32], String)> = OnceLock::new();
+/// Per-GPU mining-tier identity for rebuilds: `device_id -> (model_id, gguf_path)`. A heterogeneous
+/// rig mines a different tier per GPU (the highest its VRAM holds), so this is keyed by device rather
+/// than a single process-wide tier.
+static MINING_TIERS: OnceLock<Mutex<HashMap<u32, ([u8; 32], String)>>> = OnceLock::new();
 
-/// Record the mining tier so the miner can be rebuilt after an inference swapped the model away.
-pub fn set_mining_tier(model_id: [u8; 32], gguf_path: String) {
-    let _ = MINING_TIER.set((model_id, gguf_path));
+fn mining_tiers() -> &'static Mutex<HashMap<u32, ([u8; 32], String)>> {
+    MINING_TIERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record a GPU's mining tier so its miner can be rebuilt after an inference swapped the model away.
+pub fn set_mining_tier(device_id: u32, model_id: [u8; 32], gguf_path: String) {
+    if let Ok(mut g) = mining_tiers().lock() {
+        g.insert(device_id, (model_id, gguf_path));
+    }
 }
 
 /// Ensure the GPU miner is installed; if an inference evicted the mining model, reload it
@@ -303,9 +311,65 @@ pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
 /// PoM tier index of the mining model at a given block DAA. Recomputed per block (not frozen at
 /// index-build time) so the tier reindexing at the very-light hardfork (H2) is applied at the
 /// exact boundary — e.g. Gemma 0→1 — rather than from a stale build-time value.
-pub fn current_tier(daa: u64) -> Option<u8> {
-    let (model_id, _) = MINING_TIER.get()?;
-    crate::models::pom_tier_index(model_id, daa)
+pub fn current_tier(device_id: u32, daa: u64) -> Option<u8> {
+    let model_id = mining_tiers().lock().ok()?.get(&device_id).map(|(id, _)| *id)?;
+    crate::models::pom_tier_index(&model_id, daa)
+}
+
+/// The CUDA device that mines `model_id` (from the per-GPU tier assignment), if any. Inference for a
+/// model is routed to the device that already holds it, so only that GPU pauses mining and the walk
+/// can share the resident weights (zero-dup). Returns the lowest matching `device_id` when several
+/// GPUs mine the same tier; `None` when no GPU is assigned this model.
+pub fn device_for_model(model_id: &[u8; 32]) -> Option<u32> {
+    let g = mining_tiers().lock().ok()?;
+    g.iter().filter(|(_, (id, _))| id == model_id).map(|(dev, _)| *dev).min()
+}
+
+/// Models that OOM'd when loading on a given GPU: `(device_id, model_id)`. Once banlisted, that GPU
+/// never retries that model (avoids a hot-spin reloading a model that doesn't fit); the OOM handler
+/// downgrades the GPU to a smaller downloaded tier instead.
+static OOM_BANLIST: OnceLock<Mutex<HashSet<(u32, [u8; 32])>>> = OnceLock::new();
+
+fn oom_banlist() -> &'static Mutex<HashSet<(u32, [u8; 32])>> {
+    OOM_BANLIST.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn is_oom_banlisted(device_id: u32, model_id: &[u8; 32]) -> bool {
+    oom_banlist().lock().map(|g| g.contains(&(device_id, *model_id))).unwrap_or(false)
+}
+
+fn oom_banlist_add(device_id: u32, model_id: [u8; 32]) {
+    if let Ok(mut g) = oom_banlist().lock() {
+        g.insert((device_id, model_id));
+    }
+}
+
+/// After a GPU fails to load its assigned tier (OOM), reassign it to the largest **already-downloaded**
+/// PoM model strictly smaller than the failed one that hasn't itself been banlisted on this GPU — so a
+/// card whose VRAM estimate was optimistic (driver overhead + KV cache + fragmentation) mines a
+/// smaller tier instead of idling. Returns true if a downgrade was applied. No extra prefetch is
+/// needed: the candidate set is the served union (a mixed rig already downloaded the smaller tiers).
+fn downgrade_after_oom(device_id: u32, failed_model: &[u8; 32], daa: u64) -> bool {
+    let Some(failed_tier) = crate::models::pom_tier_index(failed_model, daa) else {
+        return false;
+    };
+    let pick = crate::slm::served_pom_specs()
+        .into_iter()
+        .filter_map(|s| crate::models::pom_tier_index(&s.model_id, daa).map(|t| (t, s)))
+        .filter(|(t, s)| *t < failed_tier && !is_oom_banlisted(device_id, &s.model_id))
+        .max_by_key(|(t, _)| *t);
+    match pick {
+        Some((tier, spec)) => {
+            let gguf = crate::slm::gguf_path_for(spec).to_string_lossy().into_owned();
+            info!("PoM[gpu{}]: OOM on tier {} — downgrading to tier {} ({}).", device_id, failed_tier, tier, spec.name);
+            set_mining_tier(device_id, spec.model_id, gguf);
+            true
+        }
+        None => {
+            log::warn!("PoM[gpu{}]: OOM and no smaller downloaded tier available — this GPU will not mine PoM (lower the tier flag or add VRAM).", device_id);
+            false
+        }
+    }
 }
 
 /// CUDA ordinal of a candle device (None if not CUDA) — used to check whether the inference
@@ -319,30 +383,35 @@ fn cuda_gpu_id(d: &Device) -> Option<usize> {
 }
 
 fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
-    let (model_id, gguf) = match MINING_TIER.get() {
+    let (model_id, gguf) = match mining_tiers().lock().ok().and_then(|g| g.get(&device_id).cloned()) {
         Some(x) => x,
         None => return false,
     };
-    // Build the possession index once (host, heavy) the first time PoM activates — deferred from
-    // boot so the pre-PoM legacy phase starts immediately and keeps host/GPU free.
-    if crate::pom::active_index().is_none() {
+    // This GPU's tier at the current block DAA (recomputed per block, H2-gated).
+    let tier = match crate::models::pom_tier_index(&model_id, daa) {
+        Some(t) => t,
+        None => return false,
+    };
+    if is_oom_banlisted(device_id, &model_id) {
+        return false; // this model OOM'd on this GPU before — don't retry (avoids a hot reload spin).
+    }
+    // Build THIS tier's possession index once (host, heavy) — deferred from boot so the pre-PoM
+    // legacy phase starts immediately, and keyed by tier so a mixed rig builds one index per
+    // distinct tier it mines (shared across every GPU on that tier).
+    if crate::pom::active_index_for_tier(tier).is_none() {
         let _guard = match index_build_lock().lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        if crate::pom::active_index().is_none() {
-            let tier = match crate::models::pom_tier_index(model_id, daa) {
-                Some(t) => t,
-                None => return false,
-            };
-            info!("PoM: building shared host weight index (gpu{}) — this can take a while…", device_id);
-            match crate::pom::WeightIndex::build_from_gguf(gguf) {
+        if crate::pom::active_index_for_tier(tier).is_none() {
+            info!("PoM: building host weight index for tier {} (gpu{}) — this can take a while…", tier, device_id);
+            match crate::pom::WeightIndex::build_from_gguf(&gguf) {
                 Ok(idx) => {
-                    info!("PoM: shared host index ready — N={} chunks", idx.n_chunks);
-                    crate::pom::set_index(idx, tier);
+                    info!("PoM: tier {} host index ready — N={} chunks", tier, idx.n_chunks);
+                    crate::pom::set_index(tier, idx);
                 }
                 Err(e) => {
-                    log::error!("PoM: shared host index build failed on gpu{}: {}", device_id, e);
+                    log::error!("PoM: host index build failed for tier {} on gpu{}: {}", tier, device_id, e);
                     return false;
                 }
             }
@@ -357,32 +426,44 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     // worth of VRAM on the serving GPU. Mining-only GPUs (no resident inference model to share)
     // fall back to a standalone copy. The N-guard below validates the gather against the host
     // index on every path, so a mismatch refuses to mine rather than producing bad proofs.
-    let m = match crate::slm::pom_shared(model_id) {
-        Some((inf_dev, shared)) if cuda_gpu_id(&inf_dev) == Some(device_id as usize) => {
-            info!("PoM[gpu{}]: zero-dup — sharing the inference engine's resident weights (no 2nd VRAM copy)", device_id);
-            PomGpuMiner::load_shared(gguf, &inf_dev, &shared)
-        }
-        _ => PomGpuMiner::load(gguf, device_id as usize),
-    };
-    match m {
-        Ok(gm) => {
-            let n = gm.n_chunks();
-            // N-guard: the gather must match the host index, else blocks would be rejected.
-            if let Some((idx, _)) = crate::pom::active_index() {
-                if n != idx.n_chunks {
-                    log::error!("PoM[gpu{}]: gather N={} != shared index N={} — refusing to mine", device_id, n, idx.n_chunks);
-                    return false;
-                }
+    // Load the miner (zero-dup on the inference GPU, else a standalone copy). A load OOM surfaces as
+    // an Err or, in cudarc, a panic; catch both so the OOM handler can banlist + downgrade instead of
+    // crashing the mining thread or hot-spinning on a model that doesn't fit this GPU.
+    let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match crate::slm::pom_shared(&model_id) {
+            Some((inf_dev, shared)) if cuda_gpu_id(&inf_dev) == Some(device_id as usize) => {
+                info!("PoM[gpu{}]: zero-dup — sharing the inference engine's resident weights (no 2nd VRAM copy)", device_id);
+                PomGpuMiner::load_shared(&gguf, &inf_dev, &shared)
             }
-            install(device_id, gm);
-            info!("PoM[gpu{}]: GPU miner ready — N={} chunks resident (matches shared index)", device_id, n);
-            true
+            _ => PomGpuMiner::load(&gguf, device_id as usize),
         }
-        Err(e) => {
-            log::error!("PoM[gpu{}]: device miner build failed: {}", device_id, e);
-            false
+    }));
+    let gm = match loaded {
+        Ok(Ok(gm)) => gm,
+        Ok(Err(e)) => {
+            log::error!("PoM[gpu{}]: device miner build failed: {} — banlisting this model and downgrading.", device_id, e);
+            oom_banlist_add(device_id, model_id);
+            downgrade_after_oom(device_id, &model_id, daa);
+            return false;
+        }
+        Err(_) => {
+            log::error!("PoM[gpu{}]: device miner load panicked (likely OOM) — banlisting this model and downgrading.", device_id);
+            oom_banlist_add(device_id, model_id);
+            downgrade_after_oom(device_id, &model_id, daa);
+            return false;
+        }
+    };
+    let n = gm.n_chunks();
+    // N-guard: the gather must match the host index, else blocks would be rejected.
+    if let Some(idx) = crate::pom::active_index_for_tier(tier) {
+        if n != idx.n_chunks {
+            log::error!("PoM[gpu{}]: gather N={} != tier {} index N={} — refusing to mine", device_id, n, tier, idx.n_chunks);
+            return false;
         }
     }
+    install(device_id, gm);
+    info!("PoM[gpu{}]: GPU miner ready — N={} chunks resident (matches shared index)", device_id, n);
+    true
 }
 
 #[cfg(test)]
