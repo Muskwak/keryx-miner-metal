@@ -64,6 +64,10 @@ struct CurrentTask {
 /// Shared inference result cache — persists across block changes so that if the
 /// same AiRequest is included in multiple consecutive job templates the miner can
 /// immediately submit with a CID once inference completed for the first occurrence.
+
+/// Max cached inference results — evict when full to prevent unbounded growth.
+const MAX_INFERENCE_CACHE_SIZE: usize = 1_000;
+
 struct InferenceCacheInner {
     /// stable_id → base58 CIDv0 string returned by IPFS after upload.
     results: HashMap<String, String>,
@@ -783,6 +787,10 @@ fn run_inference_and_upload(
     let mut guard = cache.blocking_lock();
     guard.in_progress.remove(&stable_id);
     if let Some(cid) = cid_opt {
+        if guard.results.len() >= MAX_INFERENCE_CACHE_SIZE {
+            guard.results.clear();
+            guard.results.shrink_to_fit();
+        }
         guard.results.insert(stable_id, cid);
     }
 }

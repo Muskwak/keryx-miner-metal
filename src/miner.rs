@@ -541,7 +541,10 @@ impl MinerManager {
         let mut nonce = Wrapping(thread_rng().next_u64());
         let mut mask = Wrapping(0);
         let mut fixed = Wrapping(0);
-        std::thread::spawn(move || {
+        std::thread::Builder::new()
+            .name("cpu-miner".into())
+            .stack_size(256 * 1024)
+            .spawn(move || {
             (|| {
                 let mut state = None;
 
@@ -611,7 +614,7 @@ impl MinerManager {
                 error!("CPU thread crashed: {}", e.to_string());
                 e
             })
-        })
+        }).expect("failed to spawn cpu-miner thread")
     }
 
     async fn log_hashrate(
