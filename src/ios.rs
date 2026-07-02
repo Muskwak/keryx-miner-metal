@@ -15,6 +15,23 @@ use crate::proto::{
     SubmitBlockRequestMessage,
 };
 
+// Stratum (pool) transport. Shares the wire codec with the desktop StratumHandler
+// (crate::statum_codec) so the JSON-RPC format is identical. iOS speaks a trimmed
+// subset: subscribe/authorize/declare, then set_difficulty/set_extranonce/notify →
+// mine PoM → mining.submit (MiningSubmitWithPom).
+use crate::statum_codec::{
+    MiningNotify, MiningSubmit, MiningSubscribe, NewLineJsonCodec, SetExtranonce, StratumCommand,
+    StratumError, StratumLine, StratumLinePayload, StratumResult,
+};
+use crate::target::Uint256;
+
+/// Difficulty-1 target (mantissa, exponent) — 0xffff · 2^208. Identical to the
+/// desktop StratumHandler's DIFFICULTY_1_TARGET so set_difficulty math matches.
+const DIFFICULTY_1_TARGET: (u64, i16) = (0xffffu64, 208);
+/// Capability string advertised in mining.subscribe so a Keryx pool sends
+/// daa_score-carrying notifies (ShortV2/WithTask) — required for the PoM branch.
+const KERYX_STRATUM_DAA_CAPABILITY: &str = "keryx-stratum-v2";
+
 static GRPC_ADDRESS: OnceLock<String> = OnceLock::new();
 static MINING_ADDRESS: OnceLock<String> = OnceLock::new();
 static NONCES_FOUND: AtomicU64 = AtomicU64::new(0);
@@ -259,6 +276,13 @@ pub extern "C" fn keryx_miner_start() -> bool {
         return false;
     }
 
+    // Transport is chosen by the address scheme, exactly like the desktop binary
+    // (main.rs): `stratum+tcp://host:port` → pool stratum client, anything else
+    // (bare host, `grpc://…`) → solo gRPC. A `stratum+tcp://` address fed to the
+    // gRPC path previously failed inside tonic (the "metadataMap { headers: {} }"
+    // transport error) because tonic only speaks HTTP/2 gRPC.
+    let is_stratum = address.starts_with("stratum+tcp://") || address.starts_with("stratum://");
+
     thread::spawn(move || {
         let rt = match tokio::runtime::Runtime::new() {
             Ok(r) => r,
@@ -268,7 +292,11 @@ pub extern "C" fn keryx_miner_start() -> bool {
                 return;
             }
         };
-        rt.block_on(mining_loop(address, mining_addr, stop_rx));
+        if is_stratum {
+            rt.block_on(stratum_mining_loop(address, mining_addr, stop_rx));
+        } else {
+            rt.block_on(mining_loop(address, mining_addr, stop_rx));
+        }
         RUNNING.store(false, Ordering::SeqCst);
         log_msg("ios: mining loop exited");
     });
@@ -324,11 +352,30 @@ async fn mining_loop(grpc_addr: String, mining_addr: String, mut stop_rx: watch:
     let (job_tx, job_rx) =
         crate::watch::channel::<Option<std::sync::Arc<crate::pow::State>>>(None);
 
+    // Winning blocks flow back over a transport-agnostic BlockSeed channel; the
+    // worker never knows whether it's feeding gRPC or stratum. Here (gRPC) a
+    // forwarder converts each FullBlock seed into a SubmitBlockRequest.
+    let (submit_tx, mut submit_rx) = tokio::sync::mpsc::channel::<crate::pow::BlockSeed>(16);
+    let submit_req_tx = req_tx.clone();
+    tokio::spawn(async move {
+        while let Some(seed) = submit_rx.recv().await {
+            if let crate::pow::BlockSeed::FullBlock(block) = seed {
+                log_msg("ios: submitting block…");
+                let msg = KaspadMessage {
+                    payload: Some(Payload::SubmitBlockRequest(SubmitBlockRequestMessage {
+                        block: Some(*block),
+                        allow_non_daa_blocks: false,
+                    })),
+                };
+                let _ = submit_req_tx.send(msg).await;
+            }
+        }
+    });
+
     // The GPU miner runs on its own OS thread: pom_gpu::mine() is a *blocking*
     // call and must not run on the async executor — doing so previously starved
     // this receive loop, so it fell behind the stream and mined stale templates.
-    let worker_req_tx = req_tx.clone();
-    let worker = std::thread::spawn(move || mining_worker(job_rx, worker_req_tx));
+    let worker = std::thread::spawn(move || mining_worker(job_rx, submit_tx));
 
     // Subscribe to new block templates
     let _ = req_tx
@@ -425,6 +472,285 @@ async fn mining_loop(grpc_addr: String, mining_addr: String, mut stop_rx: watch:
     log_msg("ios: mining loop ended");
 }
 
+/// Compute a Uint256 pool target from a stratum `mining.set_difficulty` value.
+/// Byte-for-byte identical to the desktop StratumHandler::set_difficulty math so
+/// the miner and pool agree on which nonces clear the share threshold.
+fn stratum_difficulty_target(difficulty: f32) -> Option<Uint256> {
+    use num::Float;
+    let mut buf = [0u64, 0u64, 0u64, 0u64];
+    let (mantissa, exponent, _) = difficulty.recip().integer_decode();
+    let new_mantissa = mantissa * DIFFICULTY_1_TARGET.0;
+    let new_exponent = (DIFFICULTY_1_TARGET.1 + exponent) as u64;
+    let start = (new_exponent / 64) as usize;
+    let remainder = new_exponent % 64;
+    buf[start] = new_mantissa << remainder;
+    if start < 3 {
+        buf[start + 1] = new_mantissa >> (64 - remainder);
+    } else if new_mantissa.leading_zeros() < remainder as u32 {
+        return None; // target too big
+    }
+    Some(Uint256::new(buf))
+}
+
+/// Apply a stratum extranonce assignment. `nonce_size` is the number of *low*
+/// bytes the miner controls; the extranonce occupies the high bytes (same
+/// convention as the desktop StratumHandler::set_extranonce). Guards the shifts
+/// so a `nonce_size >= 8` (miner owns the whole nonce) can't overflow the u64.
+fn apply_extranonce(nonce_fixed: &mut u64, nonce_mask: &mut u64, fixed: u64, nonce_size: u32) {
+    if nonce_size >= 8 {
+        *nonce_fixed = 0;
+        *nonce_mask = u64::MAX;
+    } else {
+        let bits = nonce_size * 8;
+        *nonce_fixed = fixed << bits;
+        *nonce_mask = (1u64 << bits) - 1;
+    }
+}
+
+/// Pool (stratum) mining loop — the transport counterpart of `mining_loop`.
+///
+/// Speaks the same JSON-RPC wire format as the desktop StratumHandler (via the
+/// shared `crate::statum_codec`), but trimmed to what an iOS PoM miner needs:
+/// subscribe/authorize/declare → receive set_difficulty/set_extranonce/notify →
+/// build a PoM `State` from the `PartialBlock` → grind on the shared GPU worker →
+/// submit `mining.submit` (MiningSubmitWithPom). The heavy Phase-2 OPoI inference
+/// (challenges / AiRequest CIDs) is intentionally not implemented on iOS.
+async fn stratum_mining_loop(address: String, mining_addr: String, mut stop_rx: watch::Receiver<bool>) {
+    use futures::StreamExt as _;
+    use futures_util::TryStreamExt as _;
+    use std::sync::atomic::AtomicU32;
+    use std::sync::Arc;
+
+    // Strip the scheme → bare host:port for TcpStream::connect.
+    let host_port = address
+        .strip_prefix("stratum+tcp://")
+        .or_else(|| address.strip_prefix("stratum://"))
+        .unwrap_or(&address)
+        .to_string();
+
+    log_msg(&format!("ios: stratum connecting to {host_port} …"));
+    let socket = match tokio::net::TcpStream::connect(&host_port).await {
+        Ok(s) => s,
+        Err(e) => {
+            log_msg(&format!("ios: stratum connect failed: {e}"));
+            return;
+        }
+    };
+
+    let client = tokio_util::codec::Framed::new(socket, NewLineJsonCodec::new());
+    let (send_channel, recv) = tokio::sync::mpsc::channel::<StratumLine>(16);
+    let (sink, mut stream) = client.split();
+    // Pump outbound lines from send_channel → the TCP sink.
+    tokio::spawn(async move {
+        let _ = tokio_stream::wrappers::ReceiverStream::new(recv).map(Ok).forward(sink).await;
+    });
+
+    let last_id = Arc::new(AtomicU32::new(1));
+
+    // Coalescing job channel + transport-agnostic submit channel, same as gRPC.
+    let (job_tx, job_rx) =
+        crate::watch::channel::<Option<std::sync::Arc<crate::pow::State>>>(None);
+    let (submit_tx, mut submit_rx) = tokio::sync::mpsc::channel::<crate::pow::BlockSeed>(16);
+    let worker = std::thread::spawn(move || mining_worker(job_rx, submit_tx));
+
+    // Submit forwarder: winning PartialBlock seed → mining.submit (WithPom).
+    let submit_send = send_channel.clone();
+    let submit_addr = mining_addr.clone();
+    let submit_id = last_id.clone();
+    tokio::spawn(async move {
+        while let Some(seed) = submit_rx.recv().await {
+            let crate::pow::BlockSeed::PartialBlock { id: job_id, nonce, pom_proof, .. } = seed else {
+                continue; // gRPC FullBlock never reaches the stratum forwarder
+            };
+            let nonce_hex = format!("{:016x}", nonce);
+            let opoi_tag = keryx_inference::tag_fixed(nonce);
+            let msg_id = submit_id.fetch_add(1, Ordering::SeqCst);
+            let submit = if !pom_proof.is_empty() {
+                let proof_hex = hex::encode(&pom_proof);
+                log_msg(&format!(
+                    "ios: PoM submitting share ({} B proof) job={job_id} nonce={nonce_hex}",
+                    pom_proof.len()
+                ));
+                // Fixed 6-slot PoM submit: CID stays empty at params[4], proof at params[5].
+                MiningSubmit::MiningSubmitWithPom((
+                    submit_addr.clone(),
+                    job_id,
+                    nonce_hex,
+                    opoi_tag,
+                    String::new(),
+                    proof_hex,
+                ))
+            } else {
+                MiningSubmit::MiningSubmitWithTag((submit_addr.clone(), job_id, nonce_hex, opoi_tag))
+            };
+            let line = StratumLine {
+                id: Some(msg_id),
+                payload: StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(submit)),
+                jsonrpc: None,
+                error: None,
+            };
+            if submit_send.send(line).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // ── Handshake: subscribe (with DAA capability) → authorize → declare model ──
+    let subscribe = StratumLine {
+        id: Some(last_id.fetch_add(1, Ordering::SeqCst)),
+        payload: StratumLinePayload::StratumCommand(StratumCommand::Subscribe(
+            MiningSubscribe::MiningSubscribeOptions((
+                format!("keryx-miner-ios/{}", env!("CARGO_PKG_VERSION")),
+                KERYX_STRATUM_DAA_CAPABILITY.into(),
+            )),
+        )),
+        jsonrpc: None,
+        error: None,
+    };
+    if send_channel.send(subscribe).await.is_err() {
+        log_msg("ios: stratum subscribe send failed");
+        return;
+    }
+
+    // Authorize with the pay address (devfund rotation mirrors the gRPC path).
+    let pay_address = next_pay_address(&mining_addr);
+    let authorize = StratumLine {
+        id: Some(last_id.fetch_add(1, Ordering::SeqCst)),
+        payload: StratumLinePayload::StratumCommand(StratumCommand::Authorize((
+            pay_address,
+            "x".into(),
+        ))),
+        jsonrpc: None,
+        error: None,
+    };
+    let _ = send_channel.send(authorize).await;
+
+    // Declare the very-light model so the pool bridge knows which model we hold
+    // (OPoI capability). iOS only ever mines the very-light tier.
+    if let Some(spec) = models::specs_for(VERY_LIGHT_ACTIVATION_DAA, Tier::VeryLight).first() {
+        let declare = StratumLine {
+            id: None,
+            payload: StratumLinePayload::StratumCommand(StratumCommand::MiningDeclareCapabilities(
+                vec![hex::encode(spec.model_id)],
+            )),
+            jsonrpc: None,
+            error: None,
+        };
+        let _ = send_channel.send(declare).await;
+    }
+
+    // ── Connection state (updated by set_difficulty / set_extranonce) ──
+    let mut target_pool = Uint256::new([0, 0, 0, 0]); // impossible until set_difficulty
+    let mut nonce_mask: u64 = u64::MAX; // full nonce space until set_extranonce
+    let mut nonce_fixed: u64 = 0;
+
+    // Build a PoM State from the current job + connection state and publish it.
+    macro_rules! publish_job {
+        ($id:expr, $header_hash:expr, $timestamp:expr, $daa:expr) => {{
+            let seed = crate::pow::BlockSeed::PartialBlock {
+                id: $id,
+                header_hash: $header_hash,
+                timestamp: $timestamp,
+                daa_score: $daa,
+                nonce: 0,
+                target: target_pool,
+                nonce_mask,
+                nonce_fixed,
+                hash: None,
+                pom_proof: Vec::new(),
+            };
+            match crate::pow::State::new(0, seed) {
+                Ok(s) => {
+                    let _ = job_tx.send(Some(std::sync::Arc::new(s)));
+                }
+                Err(e) => log_msg(&format!("ios: stratum bad job: {e}")),
+            }
+        }};
+    }
+
+    log_msg("ios: stratum handshake sent — waiting for jobs");
+    let mut last_tmpl_log: Option<std::time::Instant> = None;
+
+    loop {
+        tokio::select! {
+            next = stream.try_next() => {
+                let msg = match next {
+                    Ok(Some(m)) => m,
+                    Ok(None) => { log_msg("ios: stratum stream closed"); break; }
+                    Err(_) => { log_msg("ios: stratum decode error"); break; }
+                };
+                match msg {
+                    // Rejected/accepted share results carry an id + optional error.
+                    StratumLine { id: Some(_), error: Some(StratumError(code, err, _)), .. } => {
+                        log_msg(&format!("ios: share rejected ({code}): {err}"));
+                    }
+                    StratumLine { payload: StratumLinePayload::StratumResult { result }, error: None, id: Some(_), .. } => {
+                        match result {
+                            StratumResult::Plain(Some(true)) | StratumResult::Eth((true, _)) => {
+                                log_msg("ios: share accepted");
+                            }
+                            StratumResult::Subscribe((_, ref extranonce, ref nonce_size)) => {
+                                if let Ok(fixed) = u64::from_str_radix(extranonce, 16) {
+                                    apply_extranonce(&mut nonce_fixed, &mut nonce_mask, fixed, *nonce_size);
+                                    log_msg(&format!("ios: extranonce={extranonce} size={nonce_size}"));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    StratumLine { payload: StratumLinePayload::StratumCommand(command), .. } => {
+                        match command {
+                            StratumCommand::MiningSetDifficulty((difficulty,)) => {
+                                if let Some(t) = stratum_difficulty_target(difficulty) {
+                                    target_pool = t;
+                                    log_msg(&format!("ios: difficulty={difficulty} target=0x{}", hex::encode(target_pool.to_be_bytes())));
+                                } else {
+                                    log_msg("ios: set_difficulty target too big — ignored");
+                                }
+                            }
+                            StratumCommand::SetExtranonce(SetExtranonce::SetExtranoncePlain((ref extranonce, ref nonce_size))) => {
+                                if let Ok(fixed) = u64::from_str_radix(extranonce, 16) {
+                                    apply_extranonce(&mut nonce_fixed, &mut nonce_mask, fixed, *nonce_size);
+                                    log_msg(&format!("ios: extranonce={extranonce} size={nonce_size}"));
+                                }
+                            }
+                            StratumCommand::MiningNotify(MiningNotify::MiningNotifyWithTask((id, header_hash, timestamp, daa_score, _task))) => {
+                                // iOS does not run Phase-2 AiRequest inference; mine PoM on the block.
+                                publish_job!(id, header_hash, timestamp, daa_score);
+                                let stale = last_tmpl_log.map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(2));
+                                if stale { log_msg(&format!("ios: stratum job DAA={daa_score}")); last_tmpl_log = Some(std::time::Instant::now()); }
+                            }
+                            StratumCommand::MiningNotify(MiningNotify::MiningNotifyShortV2((id, header_hash, timestamp, daa_score))) => {
+                                publish_job!(id, header_hash, timestamp, daa_score);
+                                let stale = last_tmpl_log.map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(2));
+                                if stale { log_msg(&format!("ios: stratum job DAA={daa_score}")); last_tmpl_log = Some(std::time::Instant::now()); }
+                            }
+                            StratumCommand::MiningNotify(MiningNotify::MiningNotifyShort((id, header_hash, timestamp))) => {
+                                // Short notify carries no daa_score — pin to the current salt era
+                                // so the matrix generation matches (same as the desktop handler).
+                                publish_job!(id, header_hash, timestamp, crate::pow::heavy_hash::POW_SALT_V4_ACTIVATION_DAA);
+                            }
+                            StratumCommand::MiningChallenge((model_id_hex, _nonce_hex)) => {
+                                // Phase-2 OPoI challenge — not answered on iOS (no inference engine).
+                                log_msg(&format!("ios: OPoI challenge for {:.8} ignored (iOS PoM-only)", model_id_hex));
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ = stop_rx.changed() => {
+                if *stop_rx.borrow() { log_msg("ios: stop requested"); break; }
+            }
+        }
+    }
+
+    drop(job_tx);
+    let _ = worker.join();
+    log_msg("ios: stratum loop ended");
+}
+
 /// Blocking GPU mining thread — a faithful port of the desktop's
 /// `launch_gpu_miner` PoM branch (src/miner.rs). Reads the latest template from
 /// the coalescing `watch` channel, grinds one `pom_gpu::mine` batch at a time on
@@ -433,7 +759,7 @@ async fn mining_loop(grpc_addr: String, mining_addr: String, mut stop_rx: watch:
 /// call never starves the async gRPC receiver.
 fn mining_worker(
     mut job_rx: crate::watch::Receiver<Option<std::sync::Arc<crate::pow::State>>>,
-    req_tx: tokio::sync::mpsc::Sender<KaspadMessage>,
+    submit_tx: tokio::sync::mpsc::Sender<crate::pow::BlockSeed>,
 ) {
     // Persistent nonce cursor: advances by BATCH_SIZE each batch and is NOT reset
     // per template (each (template, nonce) is an independent PoM trial). Random-ish
@@ -495,9 +821,18 @@ fn mining_worker(
         let timestamp = u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap());
         let target_le = s.target.to_le_bytes();
 
+        // Honor the pool's assigned nonce sub-range: on stratum, set_extranonce
+        // pins the high bits (nonce_fixed) and leaves the low bits (nonce_mask)
+        // for us to grind. Solo gRPC leaves mask=u64::MAX / fixed=0, so `start`
+        // reduces to the raw cursor and behavior is unchanged. Submitting nonces
+        // outside the assigned range would get every share rejected by the pool.
+        let start = s.nonce_fixed | (pom_nonce & s.nonce_mask);
+
         let t0 = std::time::Instant::now();
-        let found = pom_gpu::mine(0, &pph, timestamp, &target_le, pom_nonce, BATCH_SIZE);
-        pom_nonce = pom_nonce.wrapping_add(BATCH_SIZE);
+        let found = pom_gpu::mine(0, &pph, timestamp, &target_le, start, BATCH_SIZE);
+        // Advance within the masked window (wraps inside the sub-range, not the
+        // full u64) so we keep the fixed bits intact batch after batch.
+        pom_nonce = (pom_nonce.wrapping_add(BATCH_SIZE)) & s.nonce_mask;
 
         let batches = BATCH_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
         if batches % HEARTBEAT_BATCHES == 0 {
@@ -508,18 +843,13 @@ fn mining_worker(
 
         if let Some(winning_nonce) = found {
             log_msg(&format!("ios: PoM winner nonce={winning_nonce}"));
-            if let Some(crate::pow::BlockSeed::FullBlock(found_block)) =
-                s.generate_block_if_pom(winning_nonce, index, *tier)
-            {
+            // generate_block_if_pom re-validates on the CPU and, on success,
+            // returns a seed of the *same variant* as this State's block:
+            // FullBlock for gRPC, PartialBlock (with the borsh PoM proof) for
+            // stratum. Either way the transport-specific forwarder handles it.
+            if let Some(seed) = s.generate_block_if_pom(winning_nonce, index, *tier) {
                 NONCES_FOUND.fetch_add(1, Ordering::Relaxed);
-                log_msg("ios: submitting block…");
-                let msg = KaspadMessage {
-                    payload: Some(Payload::SubmitBlockRequest(SubmitBlockRequestMessage {
-                        block: Some(*found_block),
-                        allow_non_daa_blocks: false,
-                    })),
-                };
-                let _ = req_tx.blocking_send(msg);
+                let _ = submit_tx.blocking_send(seed);
             }
             // This template is consumed — wait for a fresh one.
             state = None;
