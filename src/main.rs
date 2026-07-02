@@ -541,7 +541,9 @@ async fn main() -> Result<(), Error> {
     }
     info!("Found plugins: {:?}", plugins);
     info!("Plugins found {} workers", worker_count);
-    if worker_count == 0 && opt.num_threads.unwrap_or(0) == 0 {
+    // Apple Silicon ships no GPU plugin, but MinerManager spawns a built-in Metal PoM worker, so
+    // "no plugin workers and no CPU threads" is normal there — not a fatal misconfiguration.
+    if worker_count == 0 && opt.num_threads.unwrap_or(0) == 0 && !cfg!(target_os = "macos") {
         error!("No workers specified");
         return Err("No workers specified".into());
     }
