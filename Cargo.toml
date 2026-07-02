@@ -74,6 +74,12 @@ keccak = "0.1"
 kernel32-sys = "0.2"
 win32console = "0.1"
 
+# On non-x86_64 targets (e.g. aarch64-apple-darwin) the hand-written keccakf1600
+# assembly in src/keccakf1600_x86-64*.s is unusable, so fall back to the pure-Rust
+# `keccak` crate. src/pow/keccak.rs already selects this path via #[cfg].
+[target.'cfg(all(not(target_arch = "x86_64"), not(target_os = "windows")))'.dependencies]
+keccak = "0.1"
+
 # OPoI inference backend, chosen at build time. candle's `cuda` and `metal` features
 # are mutually exclusive backends: CUDA for NVIDIA rigs, Metal for Apple Silicon.
 # On macOS the vendored `candle-kernels` patch below is unused (it is CUDA-only) and
@@ -87,6 +93,12 @@ candle-nn = { version = "0.9", features = ["cuda"] }
 candle-core = { version = "0.9", features = ["metal"] }
 candle-transformers = { version = "0.9", features = ["metal"] }
 candle-nn = { version = "0.9", features = ["metal"] }
+# candle 0.9 wraps Metal via `candle_metal_kernels::metal` (built on objc2-metal), not the
+# metal-rs crate. Depending on the same wrapper lets pom_gpu_metal.rs use the exact same
+# Device/Buffer/CommandQueue/ComputePipeline types candle already holds — no re-wrapping.
+# objc2-metal supplies MTLSize / MTLResourceOptions used in the compute dispatch below.
+candle-metal-kernels = "0.9"
+objc2-metal = "0.3"
 
 [profile.release]
 lto = true

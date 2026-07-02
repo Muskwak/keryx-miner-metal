@@ -5,6 +5,14 @@ use std::error::Error as StdError;
 pub mod inference;
 pub mod models;
 pub mod pom;
+// PoM GPU walk: CUDA backend on Linux/Windows rigs, Metal backend on Apple Silicon. Both
+// modules expose the same free-function surface (install/uninstall/is_installed/is_loading/
+// mine/current_tier/ensure_installed/set_mining_tier), so main.rs / miner.rs / slm.rs stay
+// backend-agnostic.
+#[cfg(not(target_os = "macos"))]
+pub mod pom_gpu;
+#[cfg(target_os = "macos")]
+#[path = "pom_gpu_metal.rs"]
 pub mod pom_gpu;
 pub mod quantized_llama_split;
 pub mod quantized_qwen3_split;
