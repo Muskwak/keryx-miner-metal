@@ -41,8 +41,8 @@ jobs:
           name: keryx-miner-macos-arm64
           path: target/release/keryx-miner
 
-  build-ios-lib:
-    name: iOS Static Library
+  build-ios:
+    name: iOS Static Library + App
     runs-on: macos-latest
     steps:
       - name: Checkout sources
@@ -75,20 +75,6 @@ jobs:
         with:
           name: keryx-miner-ios-lib
           path: target/aarch64-apple-ios/release/libkeryx_miner.a
-
-  build-ios-app:
-    name: iOS App (.ipa)
-    runs-on: macos-latest
-    needs: build-ios-lib
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v4
-
-      - name: Download iOS library artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: keryx-miner-ios-lib
-          path: target/aarch64-apple-ios/release/
 
       - name: Set up Xcode
         uses: maxim-lobanov/setup-xcode@v1
