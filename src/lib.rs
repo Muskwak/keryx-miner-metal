@@ -1,8 +1,6 @@
 use clap::ArgMatches;
-use std::error::Error as StdError;
-
-#[cfg(not(target_os = "ios"))]
 use std::any::Any;
+use std::error::Error as StdError;
 
 pub mod models;
 pub mod pom;
@@ -141,13 +139,11 @@ pub trait Plugin: Any + Send + Sync {
     fn process_option(&mut self, matchs: &ArgMatches) -> Result<usize, Error>;
 }
 
-#[cfg(not(target_os = "ios"))]
 pub trait WorkerSpec: Any + Send + Sync {
     fn id(&self) -> String;
     fn build(&self) -> Box<dyn Worker>;
 }
 
-#[cfg(not(target_os = "ios"))]
 pub trait Worker {
     fn id(&self) -> String;
     fn load_block_constants(&mut self, hash_header: &[u8; 72], matrix: &[[u16; 64]; 64], target: &[u64; 4]);
