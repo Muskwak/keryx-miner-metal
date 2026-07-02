@@ -297,17 +297,17 @@ async fn mining_loop(grpc_addr: String, mining_addr: String, mut stop_rx: watch:
 
                 if let Some(winning_nonce) = found {
                     log_msg(&format!("ios: PoM winning nonce found: {}", winning_nonce));
-                    if let Some(block_seed) = state.generate_block_if_pom(winning_nonce, index, tier) {
+                    if let Some(block_seed) = state.generate_block_if_pom(winning_nonce, index, *tier) {
                         match block_seed {
                             crate::pow::BlockSeed::FullBlock(found_block) => {
                                 NONCES_FOUND.fetch_add(1, Ordering::Relaxed);
                                 log_msg("ios: submitting block…");
                                 let _ = req_tx
                                     .send(KaspadMessage {
-                                        payload: Some(Payload::SubmitBlockRequest(SubmitBlockRequestMessage {
-                                            block: *found_block.clone(),
-                                            allow_non_daa_blocks: false,
-                                        })),
+ payload: Some(Payload::SubmitBlockRequest(SubmitBlockRequestMessage {
+ block: Some(*found_block.clone()),
+ allow_non_daa_blocks: false,
+ })),
                                     })
                                     .await;
                             }

@@ -48,8 +48,8 @@ impl BlockSeed {
     pub fn report_block(&self) {
         match self {
 BlockSeed::FullBlock(block) => {
-        let mut hasher = HeaderHasher::new();
-        pow::serialize_header(&mut hasher, block.header.as_ref().unwrap_or_else(|| panic!("We just got it from the state, we should be able to hash it")), false);
+ let mut hasher = HeaderHasher::new();
+ serialize_header(&mut hasher, block.header.as_ref().unwrap_or_else(|| panic!("We just got it from the state, we should be able to hash it")), false);
         let block_hash = hasher.finalize();
         let format = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
         let block_time = OffsetDateTime::from(
