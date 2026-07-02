@@ -45,6 +45,44 @@ jobs:
           command: check
           args: --tests
 
+  check-macos:
+    # macOS build path: no CUDA/nvcc required — candle uses the Metal backend and the PoM
+    # GPU walk falls back to the pom_gpu stub (Metal port tracked separately). macos-latest
+    # is Apple Silicon (arm64), so target=aarch64-apple-darwin is a native build.
+    name: Check macOS (Metal)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v2
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v1
+
+      - name: Install stable toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+          target: aarch64-apple-darwin
+
+      - name: Cache
+        uses: actions/cache@v2
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-metal-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: cargo check (aarch64-apple-darwin, Metal)
+        uses: actions-rs/cargo@v1
+        with:
+          command: check
+          args: --target aarch64-apple-darwin --bin keryx-miner
+
   test:
     name: Test Suite
     runs-on: ${{ matrix.os }}

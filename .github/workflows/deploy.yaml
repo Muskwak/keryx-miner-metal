@@ -84,19 +84,29 @@ jobs:
           echo "archive=${asset_name}.zip" >> $GITHUB_ENV
           echo "asset_name=${asset_name}.zip" >> $GITHUB_ENV
 
-      - name: Build on MacOS
-        if: matrix.os == 'macos-latest'
+      - name: Install aarch64-apple-darwin target
+        if: matrix.os == 'macos-latest' && matrix.features == 'default'
+        run: rustup target add aarch64-apple-darwin
+
+      - name: Build on MacOS (Metal, Apple Silicon)
+        # macos-latest is Apple Silicon (arm64). The `overclock` matrix cell is a CUDA-only
+        # feature so we only run for `default` — the other matrix cell would produce an
+        # identical asset and clash on upload otherwise.
+        if: matrix.os == 'macos-latest' && matrix.features == 'default'
         run: |
-          cargo build --target=x86_64-apple-darwin --release -p kaspa-miner
-          asset_name="kaspa-miner-${{ github.event.release.tag_name }}-cpu-only-osx-amd64"
+          cargo build --target=aarch64-apple-darwin --release --bin keryx-miner
+          asset_name="keryx-miner-${{ github.event.release.tag_name }}-metal-osx-arm64"
+          strip ./target/aarch64-apple-darwin/release/keryx-miner
           mkdir ${asset_name}
-          mv ./target/x86_64-apple-darwin/release/kaspa-miner ${asset_name}/${asset_name}
+          mv ./target/aarch64-apple-darwin/release/keryx-miner ${asset_name}/${asset_name}
           tar czvf ${asset_name}.tgz ${asset_name}
           echo "archive=${asset_name}.tgz" >> $GITHUB_ENV
           echo "asset_name=${asset_name}.tgz" >> $GITHUB_ENV
 
 
       - name: Upload release asset
+        # Skip when the macOS CUDA-only matrix cell was gated out above (no archive built).
+        if: env.archive != ''
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
