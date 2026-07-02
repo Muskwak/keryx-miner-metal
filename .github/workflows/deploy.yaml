@@ -1,175 +1,51 @@
 name: Build and upload assets
+
 on:
   release:
-    types: [ published ]
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Keryx miner — Apple Silicon (Metal) fork release.
+#
+# Apple Silicon only: a single self-contained keryx-miner binary using candle's Metal backend and
+# the Metal PoM walk. macos-latest is arm64, so aarch64-apple-darwin is a native build. The in-tree
+# CUDA/OpenCL plugins exist only for upstream-backport parity and are not built or shipped here.
 
 jobs:
   build:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        # Build gnu-linux on ubuntu-18.04 and musl on ubuntu latest
-        os: [ ubuntu-18.04, windows-latest, macos-latest ]
-        features: ["default", "kaspacuda/overclock "]
-    name: Building, ${{ matrix.os }} ${{ matrix.features }}
+    name: Build macOS (Metal, Apple Silicon)
+    runs-on: macos-latest
     steps:
-      - name: Fix CRLF on Windows
-        if: runner.os == 'Windows'
-        run: git config --global core.autocrlf false
-
-      - name: Fix LibOpenCL on Linux
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt update
-          sudo apt install ocl-icd-opencl-dev -y
-
-      - name: Check out code into the Go module directory
-        uses: actions/checkout@v2
+      - uses: actions/checkout@v7
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@v1
-
-      - name: Setup Rust
-        uses: actions-rs/toolchain@v1
+        uses: arduino/setup-protoc@v3
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install CUDA Linux
-        if: runner.os == 'Linux'
-        uses: Jimver/cuda-toolkit@v0.2.8
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          cuda: '11.2.2'
-          method: 'network'
-          sub-packages: '["nvcc", "cudart"]'
+          targets: aarch64-apple-darwin
 
-      - name: Install CUDA Windows
-        if: runner.os == 'Windows'
-        uses: Jimver/cuda-toolkit@v0.2.8
-        with:
-          cuda: '11.5.1'
-          method: 'network'
-          sub-packages: '["nvcc", "cudart"]'
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Build on Linux GNU
-        if: matrix.os == 'ubuntu-18.04'
-        # We're using musl to make the binaries statically linked and portable
+      - name: Build (Metal, aarch64-apple-darwin)
         run: |
-          cargo build --target=x86_64-unknown-linux-gnu --release --all --features ${{ matrix.features }}
-          feature_name=${{ matrix.features }}
-          asset_name="kaspa-miner-${{ github.event.release.tag_name }}-${feature_name/\//-}-linux-gnu-amd64"
-          strip ./target/x86_64-unknown-linux-gnu/release/kaspa-miner
-          mkdir ${asset_name}
-          mv ./target/x86_64-unknown-linux-gnu/release/kaspa-miner ${asset_name}/${asset_name}
-          mv ./target/x86_64-unknown-linux-gnu/release/libkaspa*.so ${asset_name}/
-          tar czvf ${asset_name}.tgz ${asset_name}
-          echo "archive=${asset_name}.tgz" >> $GITHUB_ENV
-          echo "asset_name=${asset_name}.tgz" >> $GITHUB_ENV
+          cargo build --release --target aarch64-apple-darwin --bin keryx-miner
+          asset="keryx-miner-${{ github.event.release.tag_name }}-metal-osx-arm64"
+          strip target/aarch64-apple-darwin/release/keryx-miner
+          mkdir "$asset"
+          cp target/aarch64-apple-darwin/release/keryx-miner "$asset/keryx-miner"
+          cp README.md "$asset/" 2>/dev/null || true
+          tar czvf "$asset.tgz" "$asset"
+          echo "ASSET=$asset.tgz" >> "$GITHUB_ENV"
 
-
-      - name: Build on Windows
-        if: matrix.os == 'windows-latest'
-        shell: bash
-        run: |
-          cargo build --target=x86_64-pc-windows-msvc --release --all --features ${{ matrix.features }}
-          feature_name=${{ matrix.features }}
-          asset_name="kaspa-miner-${{ github.event.release.tag_name }}-${feature_name/\//-}-win64-amd64"
-          mkdir ${asset_name}
-          mv ./target/x86_64-pc-windows-msvc/release/kaspa-miner.exe ${asset_name}/${asset_name}.exe
-          mv ./target/x86_64-pc-windows-msvc/release/kaspa*.dll ${asset_name}/
-          bash ./integrations/windows/create_bat.sh ${asset_name}
-          7z a -tzip -r ${asset_name}.zip ${asset_name}
-          echo "archive=${asset_name}.zip" >> $GITHUB_ENV
-          echo "asset_name=${asset_name}.zip" >> $GITHUB_ENV
-
-      - name: Install aarch64-apple-darwin target
-        if: matrix.os == 'macos-latest' && matrix.features == 'default'
-        run: rustup target add aarch64-apple-darwin
-
-      - name: Build on MacOS (Metal, Apple Silicon)
-        # macos-latest is Apple Silicon (arm64). The `overclock` matrix cell is a CUDA-only
-        # feature so we only run for `default` — the other matrix cell would produce an
-        # identical asset and clash on upload otherwise.
-        if: matrix.os == 'macos-latest' && matrix.features == 'default'
-        run: |
-          cargo build --target=aarch64-apple-darwin --release --bin keryx-miner
-          asset_name="keryx-miner-${{ github.event.release.tag_name }}-metal-osx-arm64"
-          strip ./target/aarch64-apple-darwin/release/keryx-miner
-          mkdir ${asset_name}
-          mv ./target/aarch64-apple-darwin/release/keryx-miner ${asset_name}/${asset_name}
-          tar czvf ${asset_name}.tgz ${asset_name}
-          echo "archive=${asset_name}.tgz" >> $GITHUB_ENV
-          echo "asset_name=${asset_name}.tgz" >> $GITHUB_ENV
-
-
-      - name: Upload release asset
-        # Skip when the macOS CUDA-only matrix cell was gated out above (no archive built).
-        if: env.archive != ''
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
         with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: "./${{ env.archive }}"
-          asset_name: "${{ env.asset_name }}"
-          asset_content_type: application/zip
-
-  intergrations:
-    runs-on: ubuntu-18.04
-    strategy:
-      fail-fast: false
-      matrix:
-        # Build gnu-linux on ubuntu-18.04 and musl on ubuntu latest
-        itegration: [ hiveos ]
-    name: Integrating, ${{ matrix.itegration }}
-    steps:
-      - name: Fix LibOpenCL on Linux
-        run: |
-          sudo apt update
-          sudo apt install ocl-icd-opencl-dev -y
-
-      - name: Check out code into the module directory
-        uses: actions/checkout@v2
-
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v1
-
-      - name: Setup Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-
-      - name: Install CUDA Linux
-        if: runner.os == 'Linux'
-        uses: Jimver/cuda-toolkit@v0.2.8
-        with:
-          cuda: '11.2.2'
-          method: 'network'
-          sub-packages: '["nvcc", "cudart"]'
-
-      - name: Build ${{ matrix.itegration }} Script
-        run: |
-          cargo build --target=x86_64-unknown-linux-gnu --release --all
-          binary_name="kaspa-miner-${{ github.event.release.tag_name }}-linux-gnu-amd64"
-          asset_name="kaspa-miner-${{ matrix.itegration }}"
-          strip ./target/x86_64-unknown-linux-gnu/release/kaspa-miner
-          mkdir kaspa-miner
-          mv ./target/x86_64-unknown-linux-gnu/release/kaspa-miner kaspa-miner/${binary_name}
-          mv ./target/x86_64-unknown-linux-gnu/release/libkaspa*.so kaspa-miner/
-          bash integrations/${{ matrix.itegration }}/build.sh "${{ github.event.release.tag_name }}" "${binary_name}" kaspa-miner 
-          echo "archive=${asset_name}.tgz" >> $GITHUB_ENV
-          echo "asset_name=${asset_name}.tgz" >> $GITHUB_ENV
-
-      - name: Upload release asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: "./${{ env.archive }}"
-          asset_name: "${{ env.asset_name }}"
-          asset_content_type: application/zip
+          files: ${{ env.ASSET }}

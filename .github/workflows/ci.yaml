@@ -2,310 +2,53 @@ name: Tests
 
 on: [push, pull_request]
 
+env:
+  CARGO_TERM_COLOR: always
+
+# Keryx miner — Apple Silicon (Metal) fork.
+#
+# This fork targets Apple Silicon only: candle uses the Metal backend and the PoM GPU walk is the
+# Metal port, both selected via #[cfg(target_os = "macos")]. The CUDA/OpenCL plugins and the candle
+# CUDA backend are kept in-tree ONLY to stay close to upstream for future backports — they are not
+# built or tested here. CI builds just the `keryx-miner` binary (the root package) for
+# aarch64-apple-darwin; `-p keryx-miner` keeps the CUDA/OpenCL plugin crates out of the build.
+
 jobs:
-
-  check:
-    name: Check
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
-
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v1
-
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-
-      - name: Install cuda
-        uses: Jimver/cuda-toolkit@v0.2.8
-        with:
-          cuda: '11.2.2'
-          method: 'network'
-          sub-packages: '["nvcc", "cudart"]'
-
-      - name: Cache
-        uses: actions/cache@v2
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run cargo check
-        uses: actions-rs/cargo@v1
-        with:
-          command: check
-          args: --tests
-
-  check-macos:
-    # macOS build path: no CUDA/nvcc required — candle uses the Metal backend and the PoM
-    # GPU walk falls back to the pom_gpu stub (Metal port tracked separately). macos-latest
-    # is Apple Silicon (arm64), so target=aarch64-apple-darwin is a native build.
-    name: Check macOS (Metal)
-    runs-on: macos-latest
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
-
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v1
-
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-          target: aarch64-apple-darwin
-
-      - name: Cache
-        uses: actions/cache@v2
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-metal-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: cargo check (aarch64-apple-darwin, Metal)
-        uses: actions-rs/cargo@v1
-        with:
-          command: check
-          args: --target aarch64-apple-darwin --bin keryx-miner
-
   test:
-    name: Test Suite
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ ubuntu-latest, windows-latest ]
+    name: Test Suite (macOS, Metal)
+    runs-on: macos-latest   # Apple Silicon (arm64) — native aarch64-apple-darwin build
     steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
-
-      - name: Fix LibOpenCL on Linux
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt update
-          sudo apt install ocl-icd-opencl-dev -y
-
-      - name: Fix CRLF on Windows
-        if: runner.os == 'Windows'
-        run: git config --global core.autocrlf false
-
+      - uses: actions/checkout@v7
       - name: Install Protoc
-        uses: arduino/setup-protoc@v1
-
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
+        uses: arduino/setup-protoc@v3
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
-
-      - name: Install CUDA Linux
-        if: runner.os == 'Linux'
-        uses: Jimver/cuda-toolkit@v0.2.8
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          cuda: '11.2.2'
-          method: 'network'
-          sub-packages: '["nvcc", "cudart"]'
-
-      - name: Install CUDA Windows
-        if: runner.os == 'Windows'
-        uses: Jimver/cuda-toolkit@v0.2.8
-        with:
-          cuda: '11.5.1'
-          method: 'network'
-          sub-packages: '["nvcc", "cudart"]'
-
-      - name: Cache
-        uses: actions/cache@v2
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run cargo test regular features
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: -p kaspa-miner
-
-      - name: Run cargo test no asm
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: -p kaspa-miner --features=no-asm
-
-
-      - name: Run cargo test no parking_lot
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: -p kaspa-miner --no-default-features
-
-      - name: Run cargo test shuttle
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: -p kaspa-miner --no-default-features --features=shuttle
-
-      - name: Run cargo test for kaspaopencl
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: -p kaspaopencl
-
-
-  test-release:
-    name: Test Suite Release
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ ubuntu-latest, windows-latest ]
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
-
-      - name: Fix LibOpenCL on Linux
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt update
-          sudo apt install ocl-icd-opencl-dev -y
-
-      - name: Fix CRLF on Windows
-        if: runner.os == 'Windows'
-        run: git config --global core.autocrlf false
-
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v1
-
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-
-      - name: Install CUDA Linux
-        if: runner.os == 'Linux'
-        uses: Jimver/cuda-toolkit@v0.2.8
-        with:
-          cuda: '11.2.2'
-          method: 'network'
-          sub-packages: '["nvcc", "cudart"]'
-
-      - name: Install CUDA Windows
-        if: runner.os == 'Windows'
-        uses: Jimver/cuda-toolkit@v0.2.8
-        with:
-          cuda: '11.5.1'
-          method: 'network'
-          sub-packages: '["nvcc", "cudart"]'
-
-      - name: Cache
-        uses: actions/cache@v2
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run cargo test release regular features
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --release -p kaspa-miner
-
-      - name: Run cargo test release no asm
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --features=no-asm --release -p kaspa-miner
-
-      - name: Run cargo test release no parking_lot
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --no-default-features --release -p kaspa-miner
-
-      - name: Run cargo test release shuttle
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --no-default-features --features=shuttle --release -p kaspa-miner
-
-      - name: Run cargo test for kaspaopencl
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --release -p kaspaopencl
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (Metal)
+        run: cargo test -p keryx-miner --target aarch64-apple-darwin
+      - name: cargo test (no-asm)
+        run: cargo test -p keryx-miner --target aarch64-apple-darwin --features no-asm
+      - name: cargo test (no default features)
+        run: cargo test -p keryx-miner --target aarch64-apple-darwin --no-default-features
 
   lints:
-    name: Lints
-    runs-on: ubuntu-latest
+    name: Lints (macOS, Metal)
+    runs-on: macos-latest
     steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
-
+      - uses: actions/checkout@v7
       - name: Install Protoc
-        uses: arduino/setup-protoc@v1
-
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
+        uses: arduino/setup-protoc@v3
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
           components: rustfmt, clippy
-
-      - name: Install cuda
-        uses: Jimver/cuda-toolkit@v0.2.8
-        with:
-          cuda: '11.2.2'
-          method: 'network'
-          sub-packages: '["nvcc", "cudart"]'
-
-      - name: Cache
-        uses: actions/cache@v2
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-
-      - name: Run cargo fmt
-        uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: --all -- --check
-
-      - name: Run cargo clippy
-        uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: --tests -- -D warnings
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      - name: cargo clippy (Metal)
+        run: cargo clippy -p keryx-miner --target aarch64-apple-darwin --tests -- -D warnings
