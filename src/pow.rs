@@ -47,19 +47,20 @@ pub enum BlockSeed {
 impl BlockSeed {
     pub fn report_block(&self) {
         match self {
-            BlockSeed::FullBlock(block) => {
-                let block_hash =
-                    block.block_hash().expect("We just got it from the state, we should be able to hash it");
-                let format = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
-                let block_time = OffsetDateTime::from(
-                    UNIX_EPOCH + Duration::from_millis(block.header.as_ref().unwrap().timestamp as u64),
-                );
-                info!(
-                    "Found a block: {:x} (Timestamp: {})",
-                    block_hash,
-                    block_time.format(format).unwrap_or_else(|_| "unknown".to_string())
-                );
-            }
+BlockSeed::FullBlock(block) => {
+        let mut hasher = HeaderHasher::new();
+        pow::serialize_header(&mut hasher, block.header.as_ref().unwrap_or_else(|| panic!("We just got it from the state, we should be able to hash it")), false);
+        let block_hash = hasher.finalize();
+        let format = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+        let block_time = OffsetDateTime::from(
+            UNIX_EPOCH + Duration::from_millis(block.header.as_ref().unwrap().timestamp as u64),
+        );
+        info!(
+            "Found a block: {:x} (Timestamp: {})",
+            block_hash,
+            block_time.format(format).unwrap_or_else(|_| "unknown".to_string())
+        );
+    }
             BlockSeed::PartialBlock { .. } => info!("Found a share!"),
         }
     }
