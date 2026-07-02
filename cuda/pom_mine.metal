@@ -60,7 +60,7 @@ kernel void pom_mine(
     device const ulong*       base_offsets   [[buffer(1)]],
     device const ulong*       prefix         [[buffer(2)]],
     constant PomParams&       params         [[buffer(3)]],
-    device atomic_uint64_t*   winner         [[buffer(4)]],
+    device atomic_uint*       winner         [[buffer(4)]],
     uint tid [[thread_position_in_grid]])
 {
     if (tid >= params.n_nonces) return;
@@ -89,6 +89,10 @@ kernel void pom_mine(
     ulong pv[4];
     pom_pow_fold(state, params.p0, params.p1, params.p2, params.p3, pv);
     if (pom_le_leq(pv, params.t0, params.t1, params.t2, params.t3)) {
-        atomic_fetch_min_explicit(winner, nonce, memory_order_relaxed);
+        // MSL has no reliable 64-bit atomic min on A15-class GPUs, so we store the
+        // batch-local thread index (tid, < n_nonces ≤ 2^20, fits in 32 bits) via a
+        // universally-supported 32-bit atomic min. The host reconstructs the full
+        // 64-bit nonce as nonce_base + winner. Determinism (min tid) still holds.
+        atomic_fetch_min_explicit(winner, tid, memory_order_relaxed);
     }
 }

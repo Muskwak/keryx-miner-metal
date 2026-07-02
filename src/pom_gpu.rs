@@ -471,8 +471,11 @@ impl PomGpuMiner {
             opts,
         );
 
-        let winner_buf = device.new_buffer(std::mem::size_of::<u64>() as u64, opts);
-        unsafe { *(winner_buf.contents() as *mut u64) = u64::MAX; }
+        // 32-bit winner slot: the kernel stores the batch-local thread index (tid)
+        // via a 32-bit atomic min (64-bit atomic min is unreliable on A15). The host
+        // reconstructs the full nonce as start + winner. Sentinel = u32::MAX.
+        let winner_buf = device.new_buffer(std::mem::size_of::<u32>() as u64, opts);
+        unsafe { *(winner_buf.contents() as *mut u32) = u32::MAX; }
 
         let library = compile_metal_library(&device)?;
         let function = library
@@ -531,7 +534,7 @@ impl PomGpuMiner {
             n_nonces: batch,
         };
 
-        unsafe { *(self.winner_buf.contents() as *mut u64) = u64::MAX; }
+        unsafe { *(self.winner_buf.contents() as *mut u32) = u32::MAX; }
 
         let cmd_buf = self.queue.new_command_buffer();
         let encoder = cmd_buf.new_compute_command_encoder();
@@ -558,8 +561,10 @@ impl PomGpuMiner {
         cmd_buf.commit();
         cmd_buf.wait_until_completed();
 
-        let w = unsafe { *(self.winner_buf.contents() as *const u64) };
-        Ok(if w == u64::MAX { None } else { Some(w) })
+        // Winner holds the batch-local tid (or u32::MAX sentinel). Reconstruct the
+        // full 64-bit nonce as start + tid.
+        let w = unsafe { *(self.winner_buf.contents() as *const u32) };
+        Ok(if w == u32::MAX { None } else { Some(start + w as u64) })
     }
 }
 
