@@ -238,6 +238,7 @@ fn filter_specs_by_vram(
 async fn get_client(
     keryxd_address: String,
     mining_address: String,
+    worker: String,
     mine_when_not_synced: bool,
     block_template_ctr: Arc<AtomicU16>,
     escrow_privkey: Option<String>,
@@ -249,6 +250,7 @@ async fn get_client(
         Ok(StratumHandler::connect(
             address.to_string().clone(),
             mining_address.clone(),
+            worker,
             mine_when_not_synced,
             Some(block_template_ctr.clone()),
             ipfs_url.clone(),
@@ -282,6 +284,7 @@ async fn client_main(
     let mut client = get_client(
         opt.keryxd_address.clone(),
         opt.mining_address.clone().unwrap_or_default(),
+        opt.worker.clone(),
         opt.mine_when_not_synced,
         block_template_ctr.clone(),
         escrow_privkey,

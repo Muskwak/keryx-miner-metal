@@ -120,6 +120,8 @@ pub struct StratumHandler {
     send_channel: Sender<StratumLine>,
     stream: Pin<Box<dyn Stream<Item = Result<StratumLine, NewLineJsonCodecError>>>>,
     miner_address: String,
+    /// Pool worker name; the authorize username is `miner_address.worker` (empty = just the address).
+    worker: String,
     mine_when_not_synced: bool,
     devfund_address: Option<String>,
     devfund_percent: u16,
@@ -186,7 +188,13 @@ impl Client for StratumHandler {
             .send(StratumLine {
                 id,
                 payload: StratumLinePayload::StratumCommand(StratumCommand::Authorize((
-                    pay_address.clone(),
+                    // Pool username: `address.worker` (so the pool can tag shares per rig), or just
+                    // the address when no worker name is set.
+                    if self.worker.is_empty() {
+                        pay_address.clone()
+                    } else {
+                        format!("{}.{}", pay_address, self.worker)
+                    },
                     "x".into(),
                 ))),
                 jsonrpc: None,
@@ -243,6 +251,7 @@ impl StratumHandler {
     pub async fn connect(
         address: String,
         miner_address: String,
+        worker: String,
         mine_when_not_synced: bool,
         block_template_ctr: Option<Arc<AtomicU16>>,
         ipfs_url: String,
@@ -275,6 +284,7 @@ impl StratumHandler {
             stream: Box::pin(stream),
             send_channel,
             miner_address,
+            worker,
             mine_when_not_synced,
             devfund_address: None,
             devfund_percent: 0,
