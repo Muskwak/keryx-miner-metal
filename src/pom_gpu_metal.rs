@@ -32,7 +32,8 @@ use candle_metal_kernels::metal::{
     Device as MtlDevice, MTLResourceOptions,
 };
 use objc2_metal::{
-    MTLBuffer as _, MTLResourceOptions as ObjcMTLResourceOptions, MTLResourceUsage, MTLSize,
+    MTLBuffer as _, MTLDevice as _, MTLResourceOptions as ObjcMTLResourceOptions, MTLResourceUsage,
+    MTLSize,
 };
 
 const METAL_SRC: &str = include_str!("../metal/pom_mine.metal");
@@ -257,6 +258,32 @@ fn words4(b: &[u8; 32]) -> [u64; 4] {
         *wi = u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
     }
     w
+}
+
+/// Total usable GPU memory (MB) of every Metal device, in candle's `Device::new_metal` order — the
+/// Metal analogue of the CUDA path's `query_all_gpus_vram`, so an entry `(id, mb)` is the budget of
+/// the device the miner would mine/serve on for that `id`. Apple Silicon exposes a single
+/// unified-memory GPU (id 0). Sourced from Metal's `recommendedMaxWorkingSetSize` — the driver's own
+/// budget for resident resources (≈75% of unified RAM) rather than total RAM — so it matches what
+/// candle/PoM can actually keep resident before eviction, the role CUDA's per-device `total_mem`
+/// plays on a discrete card. Returns an empty vec when no Metal device is present. Never panics — a
+/// device-open failure is caught and treated as "no device".
+pub fn query_all_gpus_vram() -> Vec<(usize, u64)> {
+    std::panic::catch_unwind(|| {
+        let cdev = match Device::new_metal(0) {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+        let bytes = match &cdev {
+            // `recommendedMaxWorkingSetSize` is an MTLDevice property (bytes); reach the objc2
+            // protocol object through candle's wrapper the same way the gather reads
+            // `buffer.as_ref().gpuAddress()` in `PomGpuMiner::load`.
+            Device::Metal(m) => m.metal_device().as_ref().recommendedMaxWorkingSetSize(),
+            _ => return Vec::new(),
+        };
+        vec![(0usize, bytes / (1024 * 1024))]
+    })
+    .unwrap_or_default()
 }
 
 // ─── Per-device miner registry ────────────────────────────────────────────────────────────

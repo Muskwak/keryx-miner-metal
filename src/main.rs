@@ -182,31 +182,26 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
     }
 }
 
-/// GPU 0 total VRAM (MB) via nvidia-smi, or None when nvidia-smi is unavailable or
-/// unparseable (e.g. AMD-only machines). GPU 0 is the device the miner mines/serves on.
+/// Total VRAM (MB) of the CUDA device the miner mines/serves on (CUDA device 0), or None when no
+/// CUDA device is present (CPU-only / AMD hosts). Sourced from the CUDA driver so it matches the
+/// `device_id` candle/PoM actually load onto — unlike nvidia-smi, whose PCI ordering can disagree
+/// with CUDA's `FASTEST_FIRST` default on a mixed rig and report a different card's VRAM.
 fn query_vram_mb() -> Option<u64> {
-    let output = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()
-        .and_then(|l| l.trim().parse::<u64>().ok())
+    keryx_miner::pom_gpu::query_all_gpus_vram()
+        .into_iter()
+        .find(|(id, _)| *id == 0)
+        .map(|(_, mb)| mb)
 }
 
 /// OPoI capability gate (layer A): drop the models this machine cannot actually
-/// serve on GPU 0, so the `ai:cap` announcement never promises a model the miner
-/// would fail to load. Skipped when nvidia-smi is unavailable (CPU-fallback setups
+/// serve on CUDA device 0, so the `ai:cap` announcement never promises a model the miner
+/// would fail to load. Skipped when no CUDA device is present (CPU-fallback setups
 /// keep working).
 fn filter_specs_by_vram(
     specs: &'static [&'static keryx_miner::models::ModelSpec],
 ) -> &'static [&'static keryx_miner::models::ModelSpec] {
     let Some(gpu0_mb) = query_vram_mb() else {
-        log::warn!("Cannot query GPU VRAM (nvidia-smi) — skipping the model capability gate.");
+        log::warn!("Cannot query GPU VRAM (CUDA driver) — skipping the model capability gate.");
         return specs;
     };
     let kept: Vec<&'static keryx_miner::models::ModelSpec> = specs
@@ -217,7 +212,7 @@ fn filter_specs_by_vram(
                 true
             } else {
                 log::warn!(
-                    "✗  '{}' needs ≥{} MB VRAM but only {} MB on GPU 0 — model NOT announced (ai:cap) and not downloaded.",
+                    "✗  '{}' needs ≥{} MB VRAM but only {} MB on CUDA device 0 — model NOT announced (ai:cap) and not downloaded.",
                     spec.name,
                     spec.min_vram_mb,
                     gpu0_mb,

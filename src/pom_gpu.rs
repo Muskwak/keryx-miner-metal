@@ -30,6 +30,35 @@ fn words4(b: &[u8; 32]) -> [u64; 4] {
     w
 }
 
+/// Total VRAM (MB) of every CUDA device, in **CUDA device order** — the same ordering
+/// `Device::new_cuda(id)` uses — so an entry `(id, mb)` is the VRAM of the device the miner would
+/// mine/serve on for that `id`. Sourced from the CUDA driver, NOT nvidia-smi: nvidia-smi orders by
+/// PCI position, which disagrees with CUDA's default `FASTEST_FIRST` ordering on a mixed rig, so a
+/// line-order mapping would read the wrong card's VRAM. Returns an empty vec when no CUDA driver is
+/// present (CPU-only / AMD hosts). Never panics — a driver-load failure inside cudarc is caught and
+/// treated as "no devices".
+pub fn query_all_gpus_vram() -> Vec<(usize, u64)> {
+    use candle_core::cuda_backend::cudarc::driver::result;
+    std::panic::catch_unwind(|| {
+        if result::init().is_err() {
+            return Vec::new();
+        }
+        let count = result::device::get_count().unwrap_or(0);
+        let mut out = Vec::with_capacity(count.max(0) as usize);
+        for ordinal in 0..count {
+            let Ok(dev) = result::device::get(ordinal) else {
+                continue;
+            };
+            // SAFETY: `dev` is a valid device handle just returned by `device::get(ordinal)`.
+            if let Ok(bytes) = unsafe { result::device::total_mem(dev) } {
+                out.push((ordinal as usize, (bytes / (1024 * 1024)) as u64));
+            }
+        }
+        out
+    })
+    .unwrap_or_default()
+}
+
 pub struct PomGpuMiner {
     cuda: CudaDevice,
     stream: Arc<CudaStream>,
