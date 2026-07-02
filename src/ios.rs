@@ -1,5 +1,5 @@
 use std::ffi::{CStr, CString};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 
@@ -23,6 +23,29 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 static STOP_TX: OnceLock<watch::Sender<bool>> = OnceLock::new();
 
 const BATCH_SIZE: u64 = 1 << 20;
+
+/// Same mechanism as the desktop CLI's `--devfund-percent` (src/cli.rs,
+/// src/client/grpc.rs::get_block_template): out of every 10_000 block-template
+/// requests, `DEVFUND_PERCENT` of them pay to `DEVFUND_ADDRESS` instead of the
+/// user's mining address. Floored at 2% (200/10_000) — not user-configurable
+/// on iOS, matching the desktop's forced minimum in `parse_devfund_percent`.
+const DEVFUND_ADDRESS: &str = "keryx:qpcptntu45n0xtyq60apnwnhpkta0ujzt5sy3uk5v6nrjvxlqhamjyc882jj3";
+const DEVFUND_PERCENT: u16 = 200;
+static DEVFUND_CTR: AtomicU16 = AtomicU16::new(0);
+
+/// Picks the pay_address for the next GetBlockTemplateRequest, rotating a
+/// fraction of requests to the devfund address. Mirrors
+/// `GrpcClient::get_block_template`'s counter/modulo-10_000 logic.
+fn next_pay_address(mining_addr: &str) -> String {
+    let counter = DEVFUND_CTR.load(Ordering::SeqCst);
+    let addr = if counter <= DEVFUND_PERCENT {
+        DEVFUND_ADDRESS.to_string()
+    } else {
+        mining_addr.to_string()
+    };
+    let _ = DEVFUND_CTR.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000));
+    addr
+}
 
 fn log_msg(msg: &str) {
     let log = LAST_LOG.get_or_init(|| Mutex::new(String::new()));
@@ -172,6 +195,11 @@ pub extern "C" fn keryx_miner_start() -> bool {
     let _ = STOP_TX.set(stop_tx);
 
     log_msg("ios: starting mining runtime…");
+    log_msg(&format!(
+        "ios: devfund enabled, mining {:.2}% of the time to {}",
+        DEVFUND_PERCENT as f64 / 100.0,
+        DEVFUND_ADDRESS
+    ));
 
     // Defensive: normally already done by keryx_miner_initialize() at app
     // launch, but cover the case where Swift skipped that call.
@@ -246,7 +274,7 @@ async fn mining_loop(grpc_addr: String, mining_addr: String, mut stop_rx: watch:
     let _ = req_tx
         .send(KaspadMessage {
             payload: Some(Payload::GetBlockTemplateRequest(GetBlockTemplateRequestMessage {
-                pay_address: mining_addr.clone(),
+                pay_address: next_pay_address(&mining_addr),
                 extra_data: format!("keryx-miner-ios/{}", env!("CARGO_PKG_VERSION")),
                 inference_result: String::new(),
             })),
@@ -275,7 +303,7 @@ async fn mining_loop(grpc_addr: String, mining_addr: String, mut stop_rx: watch:
                                     log_msg("ios: new block template available, requesting…");
                                     let _ = req_tx.send(KaspadMessage {
                                         payload: Some(Payload::GetBlockTemplateRequest(GetBlockTemplateRequestMessage {
-                                            pay_address: mining_addr.clone(),
+                                            pay_address: next_pay_address(&mining_addr),
                                             extra_data: format!("keryx-miner-ios/{}", env!("CARGO_PKG_VERSION")),
                                             inference_result: String::new(),
                                         })),
