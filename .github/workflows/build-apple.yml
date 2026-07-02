@@ -112,7 +112,11 @@ jobs:
           cd ios-app
           mkdir -p Payload
           cp -r build/keryx-ios.xcarchive/Products/Applications/keryx-ios.app Payload/
-          zip -r keryx-ios-unsigned.ipa Payload/
+          # `ditto` (not `zip -r`) — AltStore's on-device zip reader has been reported to
+          # reject archives from `zip -r` with "the data couldn't be read because it isn't
+          # in the correct format" even though `unzip`/Finder open them fine. `ditto` is
+          # what Xcode itself uses to produce .ipa exports and matches what AltStore expects.
+          ditto -c -k --sequesterRsrc --keepParent Payload keryx-ios-unsigned.ipa
           rm -rf Payload
 
       - name: Upload iOS .ipa artifact
