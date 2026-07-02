@@ -70,6 +70,13 @@ jobs:
       - name: Build iOS static library
         run: cargo build --release --target aarch64-apple-ios --lib
 
+      - name: Verify static library exists
+        run: |
+          echo "=== Checking target directory ==="
+          ls -la target/aarch64-apple-ios/release/
+          echo "=== Searching for libkeryx_miner ==="
+          find target/ -name "libkeryx_miner*" 2>/dev/null || echo "No libkeryx_miner files found!"
+
       - name: Upload iOS artifact
         uses: actions/upload-artifact@v4
         with:
