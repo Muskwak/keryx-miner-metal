@@ -8,9 +8,16 @@ readme = "README.md"
 description = "A fast CPU & GPU miner for Keryx"
 categories = ["command-line-utilities"]
 keywords = ["blockchain", "cli"]
-# On macOS: produce a binary (keryx-miner). On iOS: produce a static library
-# that gets linked into the native Swift app wrapper.
-crate-type = ["bin", "staticlib"]
+autobins = false
+
+[lib]
+name = "keryx_miner"
+path = "src/lib.rs"
+crate-type = ["lib", "staticlib"]
+
+[[bin]]
+name = "keryx-miner"
+path = "src/main.rs"
 include = [
     "src/**/*.rs",
     "src/**/*.s",
