@@ -42,6 +42,7 @@ jobs:
           mkdir "$asset"
           cp target/aarch64-apple-darwin/release/keryx-miner "$asset/keryx-miner"
           cp README.md "$asset/" 2>/dev/null || true
+          cp start-mining-mac.sh "$asset/" 2>/dev/null || true
           tar czvf "$asset.tgz" "$asset"
           echo "ASSET=$asset.tgz" >> "$GITHUB_ENV"
 
