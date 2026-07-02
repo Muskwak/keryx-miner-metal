@@ -70,6 +70,33 @@ fn next_pay_address(mining_addr: &str) -> String {
     addr
 }
 
+/// Builds the coinbase `extra_data` for a solo (gRPC) GetBlockTemplateRequest.
+///
+/// The node validates that every block's coinbase carries a Phase-2 OPoI tag:
+/// `/{nonce_hex}/ai:v1:{tag}` where `tag = keryx_inference::tag_fixed(nonce)`
+/// (a bit-exact fixed-point MLP the node recomputes). Without it the node
+/// rejects the submitted block as `BlockInvalid` — which is exactly what a plain
+/// `extra_data` produced. This mirrors `GrpcClient::client_get_block_template`
+/// (src/client/grpc.rs): a fresh random coinbase nonce (distinct from the PoW
+/// nonce — it only keeps parallel coinbases unique), the tag over it, and the
+/// loaded-model capability so the node's model-id enforcement passes.
+fn build_template_extra_data() -> String {
+    let nonce = rand::random::<u64>();
+    let nonce_hex = format!("{:016x}", nonce);
+    let opoi_tag = keryx_inference::tag_fixed(nonce);
+    let cap_part = models::specs_for(VERY_LIGHT_ACTIVATION_DAA, Tier::VeryLight)
+        .first()
+        .map(|s| format!("/ai:cap:{}", hex::encode(s.model_id)))
+        .unwrap_or_default();
+    format!(
+        "keryx-miner-ios/{}/{}/ai:v1:{}{}",
+        env!("CARGO_PKG_VERSION"),
+        nonce_hex,
+        opoi_tag,
+        cap_part
+    )
+}
+
 fn log_msg(msg: &str) {
     let log = LAST_LOG.get_or_init(|| Mutex::new(String::new()));
     if let Ok(mut log) = log.lock() {
@@ -389,7 +416,7 @@ async fn mining_loop(grpc_addr: String, mining_addr: String, mut stop_rx: watch:
         .send(KaspadMessage {
             payload: Some(Payload::GetBlockTemplateRequest(GetBlockTemplateRequestMessage {
                 pay_address: next_pay_address(&mining_addr),
-                extra_data: format!("keryx-miner-ios/{}", env!("CARGO_PKG_VERSION")),
+                extra_data: build_template_extra_data(),
                 inference_result: String::new(),
             })),
         })
@@ -433,7 +460,7 @@ async fn mining_loop(grpc_addr: String, mining_addr: String, mut stop_rx: watch:
                                     let _ = req_tx.send(KaspadMessage {
                                         payload: Some(Payload::GetBlockTemplateRequest(GetBlockTemplateRequestMessage {
                                             pay_address: next_pay_address(&mining_addr),
-                                            extra_data: format!("keryx-miner-ios/{}", env!("CARGO_PKG_VERSION")),
+                                            extra_data: build_template_extra_data(),
                                             inference_result: String::new(),
                                         })),
                                     }).await;
