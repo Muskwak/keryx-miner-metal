@@ -18,12 +18,7 @@ jobs:
       - name: Install Protoc
         uses: arduino/setup-protoc@v1
 
-      - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache
         uses: actions/cache@v4
@@ -58,12 +53,7 @@ jobs:
       - name: Install Protoc
         uses: arduino/setup-protoc@v1
 
-      - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Add iOS target
         run: rustup target add aarch64-apple-ios
@@ -150,12 +140,7 @@ jobs:
       - name: Install Protoc
         uses: arduino/setup-protoc@v1
 
-      - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache
         uses: actions/cache@v4
