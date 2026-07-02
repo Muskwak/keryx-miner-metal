@@ -405,20 +405,31 @@ impl PomGpuMiner {
         names.sort();
 
         let cpu = Device::Cpu;
-        let mut all_data: Vec<u8> = Vec::new();
-        let mut base_offsets: Vec<u64> = Vec::new();
-        let mut prefix: Vec<u64> = vec![0];
 
+        // Pass 1: measure each tensor's byte length (dropped immediately after) to size
+        // the Metal buffer up front. Previously this accumulated every tensor into one
+        // CPU-side `all_data: Vec<u8>` (~1 GB for a 1.7B model) before a single GPU
+        // upload — for a moment both the full Vec AND the freshly-copied Metal buffer
+        // were resident simultaneously (~2 GB peak), which on an iPhone's tighter memory
+        // budget got the app killed by the OS right after "got block template" (this is
+        // the first time ensure_installed's model load runs). Streaming tensor-by-tensor
+        // below keeps only one tensor's bytes live at a time alongside the single
+        // full-size Metal buffer.
+        let mut base_offsets: Vec<u64> = Vec::with_capacity(names.len());
+        let mut prefix: Vec<u64> = vec![0];
+        let mut tensor_lens: Vec<usize> = Vec::with_capacity(names.len());
+        let mut total_bytes: u64 = 0;
         for name in &names {
             let qt = content.tensor(&mut file, name, &cpu)?;
             let bytes = qt.data()?;
             let n = bytes.len();
+            tensor_lens.push(n);
             let chunks = n / CHUNK_BYTES;
             if chunks == 0 {
                 continue;
             }
-            base_offsets.push(all_data.len() as u64);
-            all_data.extend_from_slice(&bytes);
+            base_offsets.push(total_bytes);
+            total_bytes += n as u64;
             prefix.push(prefix.last().unwrap() + chunks as u64);
         }
 
@@ -429,12 +440,24 @@ impl PomGpuMiner {
         let t_count = base_offsets.len() as u32;
 
         let opts = metal::MTLResourceOptions::StorageModeShared;
-        let all_data_buf = device.new_buffer_with_data(
-            all_data.as_ptr() as *const std::ffi::c_void,
-            all_data.len() as u64,
-            opts,
-        );
-        drop(all_data); // free the temp CPU copy
+        let all_data_buf = device.new_buffer(total_bytes, opts);
+        let dst = all_data_buf.contents() as *mut u8;
+
+        // Pass 2: re-read each tensor and copy its bytes directly into the Metal buffer
+        // at its offset. Re-reading from disk is a one-time cost per app launch (only
+        // runs the first time a block template arrives) and is worth halving peak RAM.
+        let mut write_off: u64 = 0;
+        for (name, &n) in names.iter().zip(tensor_lens.iter()) {
+            if n / CHUNK_BYTES == 0 {
+                continue;
+            }
+            let qt = content.tensor(&mut file, name, &cpu)?;
+            let bytes = qt.data()?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.add(write_off as usize), bytes.len());
+            }
+            write_off += n as u64;
+        }
 
         let base_offsets_buf = device.new_buffer_with_data(
             base_offsets.as_ptr() as *const std::ffi::c_void,
