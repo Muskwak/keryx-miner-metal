@@ -152,10 +152,33 @@ impl MinerManager {
             handles.append(&mut Self::launch_gpu_threads(
                 send_channel.clone(),
                 Arc::clone(&hashes_tried),
-                recv,
+                recv.clone(),
                 manager,
                 hashes_by_worker.clone(),
             ));
+        }
+        // Apple Silicon builds no GPU plugin, so `has_specs()` is false and `launch_gpu_miner`
+        // never spawns — and that worker is the *only* caller of `pom_gpu::ensure_installed`, which
+        // builds the shared PoM weight index (`active_index`). Without it the miner could not mine
+        // PoM at all: not the Metal GPU walk, and not the CPU fallback (which also needs
+        // `active_index`). Spawn one dedicated Metal PoM worker on device 0 to drive the walk and
+        // bootstrap the index. Skipped if a plugin already registered a worker (it drives the Metal
+        // walk itself, since `pom_gpu::mine` resolves to the Metal backend on macOS).
+        #[cfg(target_os = "macos")]
+        {
+            if !manager.has_specs() {
+                let worker_hashes_tried = Arc::new(AtomicU64::new(0));
+                hashes_by_worker
+                    .lock()
+                    .unwrap()
+                    .insert("#0 (Metal)".to_string(), Arc::clone(&worker_hashes_tried));
+                handles.push(Self::launch_metal_pom_miner(
+                    send_channel.clone(),
+                    recv.clone(),
+                    Arc::clone(&hashes_tried),
+                    worker_hashes_tried,
+                ));
+            }
         }
         Self {
             handles,
@@ -411,6 +434,99 @@ impl MinerManager {
             })()
             .map_err(|e: Error| {
                 error!("{}: GPU thread crashed: {}", gpu_work.id(), e.to_string());
+                e
+            })
+        })
+    }
+
+    /// Apple Silicon PoM worker. Apple Silicon loads no GPU plugin (so `has_specs()` is false and
+    /// `launch_gpu_miner` never spawns) and Metal has no kHeavyHash kernel, so this dedicated thread
+    /// drives the Metal PoM walk (`pom_gpu::mine`, which resolves to the Metal backend on macOS) and
+    /// bootstraps the shared host weight index via `ensure_installed`. It mirrors the PoM branch of
+    /// `launch_gpu_miner`; pre-PoM templates carry no GPU work here (kHeavyHash is CPU-only on
+    /// Apple Silicon), so they are skipped and left to the CPU workers.
+    #[cfg(target_os = "macos")]
+    #[allow(unreachable_code)]
+    fn launch_metal_pom_miner(
+        send_channel: Sender<BlockSeed>,
+        mut block_channel: watch::Receiver<Option<WorkerCommand>>,
+        hashes_tried: Arc<AtomicU64>,
+        worker_hashes_tried: Arc<AtomicU64>,
+    ) -> MinerHandler {
+        // Single Apple Silicon GPU. POM_BATCH must stay < u32::MAX — the Metal winner atomic is a
+        // 32-bit tid (see pom_gpu_metal.rs) — and mirrors the value used in launch_gpu_miner.
+        const DEVICE_ID: u32 = 0;
+        const POM_BATCH: u64 = 1 << 20;
+        std::thread::spawn(move || {
+            (|| {
+                let mut state: Option<Box<pow::State>> = None;
+                let mut pom_nonce: u64 = thread_rng().next_u64();
+                loop {
+                    if state.is_none() {
+                        state = match block_channel.wait_for_change() {
+                            Ok(Some(WorkerCommand::Job(s))) => Some(s),
+                            Ok(Some(WorkerCommand::Close)) => return Ok(()),
+                            Ok(None) => None,
+                            Err(e) => {
+                                info!("Metal PoM thread closing: {}", e.to_string());
+                                return Ok(());
+                            }
+                        };
+                    }
+                    // Metal only mines PoM. A pre-PoM template has no GPU path here, so drop it and
+                    // wait for the next one — the CPU workers cover pre-PoM kHeavyHash.
+                    if !matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::POM_ACTIVATION_DAA) {
+                        state = None;
+                        continue;
+                    }
+                    let (pph, time, target_le, daa) = {
+                        let s = state.as_ref().unwrap();
+                        let mut pph = [0u8; 32];
+                        pph.copy_from_slice(&s.pow_hash_header[0..32]);
+                        let time = u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap());
+                        (pph, time, s.target.to_le_bytes(), s.daa_score)
+                    };
+                    // An OPoI inference may have evicted the mining model (inference has priority).
+                    // Rebuild the walk — and, on the first PoM block, build the shared host index.
+                    if !keryx_miner::pom_gpu::is_installed(DEVICE_ID) {
+                        keryx_miner::pom_gpu::ensure_installed(DEVICE_ID, daa);
+                    }
+                    let found =
+                        keryx_miner::pom_gpu::mine(DEVICE_ID, &pph, time, &target_le, pom_nonce, POM_BATCH);
+                    pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
+                    hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
+                    worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
+                    if let Some(nonce) = found {
+                        // Rebuild the proof on the host (raw GGUF). `generate_block_if_pom` re-walks
+                        // and checks pow_value <= target, so a Metal/host byte divergence yields None
+                        // (no bad block is ever submitted) rather than an invalid block.
+                        let built = state.as_ref().and_then(|s| {
+                            keryx_miner::pom::active_index().and_then(|(idx, _)| {
+                                let tier = keryx_miner::pom_gpu::current_tier(s.daa_score)?;
+                                s.generate_block_if_pom(nonce, idx, tier)
+                            })
+                        });
+                        if let Some(block_seed) = built {
+                            match send_channel.blocking_send(block_seed.clone()) {
+                                Ok(()) => block_seed.report_block(),
+                                Err(e) => error!("Failed submitting PoM block: ({})", e.to_string()),
+                            }
+                            if let BlockSeed::FullBlock(_) = block_seed {
+                                state = None;
+                            }
+                        }
+                    } else if let Some(cmd) = block_channel.get_changed()? {
+                        state = match cmd {
+                            Some(WorkerCommand::Job(ns)) => Some(ns),
+                            Some(WorkerCommand::Close) => return Ok(()),
+                            None => state,
+                        };
+                    }
+                }
+                Ok(())
+            })()
+            .map_err(|e: Error| {
+                error!("Metal PoM thread crashed: {}", e.to_string());
                 e
             })
         })
