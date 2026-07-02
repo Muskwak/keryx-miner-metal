@@ -12,7 +12,7 @@ use crate::proto::kaspad_message::Payload;
 use crate::proto::rpc_client::RpcClient;
 use crate::proto::{
     GetBlockTemplateRequestMessage, KaspadMessage, NotifyNewBlockTemplateRequestMessage,
-    SubmitBlockRequestMessage, SubmitBlockResponseMessage, RpcBlock,
+    RpcBlock, SubmitBlockRequestMessage,
 };
 
 static GRPC_ADDRESS: OnceLock<String> = OnceLock::new();
@@ -36,14 +36,77 @@ fn log_msg(msg: &str) {
     }
 }
 
+static MODEL_BASE: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+/// The root that holds one sub-directory per tier-model. Defaults to
+/// `<exe_dir>/keryx-models` (desktop fallback) until Swift overrides it via
+/// `keryx_miner_set_doc_path` with the app's sandboxed Documents URL.
 fn model_dir() -> std::path::PathBuf {
-    let mut p = std::env::current_exe().unwrap_or_default();
-    p.pop();
-    p.push("models");
-    p
+    MODEL_BASE
+        .get_or_init(|| {
+            let mut p = std::env::current_exe().unwrap_or_default();
+            p.pop();
+            p.push("keryx-models");
+            p
+        })
+        .clone()
 }
 
+/// Called once from the SwiftUI App with the sandbox documents URL.
+/// We append "keryx-models/" so downloads are isolated from user files.
+/// Must be called before the first `model_dir()` access (i.e. before
+/// `keryx_miner_initialize`/`keryx_miner_start`) or it has no effect.
+#[no_mangle]
+pub extern "C" fn keryx_miner_set_doc_path(path: *const std::ffi::c_char) -> bool {
+    let c_str = unsafe { CStr::from_ptr(path) };
+    let s = match c_str.to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let mut p = std::path::PathBuf::from(s);
+    p.push("keryx-models");
+    let _ = std::fs::create_dir_all(&p);
+    // First call wins (matches MODEL_BASE's OnceLock semantics) — fine since
+    // Swift only calls this once, at app launch.
+    let _ = MODEL_BASE.set(p);
+    true
+}
+
+/// iOS only ever mines the `--very-light` tier (Qwen3-1.7B, ~1-2 GB) — it's the
+/// only tier that fits alongside iOS in an iPhone's RAM. This downloads the
+/// model (if needed) and registers it with `pom_gpu` so `ensure_installed` can
+/// build the weight index. Idempotent: `pom_gpu::set_mining_tier` is a
+/// OnceLock, so calling this from both `keryx_miner_initialize` (at launch)
+/// and `keryx_miner_start` (defensively, in case initialize wasn't called)
+/// is safe as long as both target the same tier.
+fn ensure_mining_model_ready() -> bool {
+    let specs: &[&ModelSpec] = models::specs_for(VERY_LIGHT_ACTIVATION_DAA, Tier::VeryLight);
+    let Some(spec) = specs.first() else {
+        return false;
+    };
+    if !download_model(spec) {
+        return false;
+    }
+    let gguf_path = model_dir().join(format!("{}.gguf", spec.dir_name));
+    pom_gpu::set_mining_tier(spec.model_id, gguf_path.to_string_lossy().into_owned());
+    true
+}
+
+/// Called from the SwiftUI App on launch so the (multi-GB) model download
+/// happens while the user is looking at the UI, not after they tap Start.
+#[no_mangle]
+pub extern "C" fn keryx_miner_initialize() -> bool {
+    ensure_mining_model_ready()
+}
+
+/// Serializes model downloads: `keryx_miner_initialize` (launch, background
+/// thread) and `keryx_miner_start` (defensive fallback) can both call
+/// `download_model` for the same file — without this, a Start tap mid-launch
+/// download would race two writers on the same path.
+static DOWNLOAD_LOCK: Mutex<()> = Mutex::new(());
+
 fn download_model(spec: &ModelSpec) -> bool {
+    let _guard = DOWNLOAD_LOCK.lock();
     let dir = model_dir();
     let ok_file = dir.join(".ok");
     if ok_file.exists() {
@@ -117,18 +180,12 @@ pub extern "C" fn keryx_miner_start() -> bool {
 
     log_msg("ios: starting mining runtime…");
 
-    // Pre-download the very-light model if needed
-    let very_light_specs: &[&ModelSpec] = models::specs_for(VERY_LIGHT_ACTIVATION_DAA, Tier::VeryLight);
-    if !very_light_specs.is_empty() {
-        let spec = very_light_specs[0];
-        if !download_model(spec) {
-            log_msg("ios: FAILED to download model — cannot mine");
-            RUNNING.store(false, Ordering::SeqCst);
-            return false;
-        }
-
-        let gguf_path = model_dir().join(format!("{}.gguf", spec.dir_name));
-        pom_gpu::set_mining_tier(spec.model_id, gguf_path.to_string_lossy().into_owned());
+    // Defensive: normally already done by keryx_miner_initialize() at app
+    // launch, but cover the case where Swift skipped that call.
+    if !ensure_mining_model_ready() {
+        log_msg("ios: FAILED to download model — cannot mine");
+        RUNNING.store(false, Ordering::SeqCst);
+        return false;
     }
 
     thread::spawn(move || {

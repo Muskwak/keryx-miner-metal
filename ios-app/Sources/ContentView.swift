@@ -1,6 +1,12 @@
 import SwiftUI
 
 // Rust FFI declarations
+@_silgen_name("keryx_miner_set_doc_path")
+func keryx_miner_set_doc_path(_ path: UnsafePointer<CChar>) -> Bool
+
+@_silgen_name("keryx_miner_initialize")
+func keryx_miner_initialize() -> Bool
+
 @_silgen_name("keryx_miner_connect")
 func keryx_miner_connect(_ address: UnsafePointer<CChar>) -> Bool
 
@@ -97,6 +103,16 @@ struct ContentView: View {
             .navigationTitle("Keryx Miner")
             .navigationBarTitleDisplayMode(.inline)
         }
+        .onAppear {
+            // Status polling (and the model download it reports on) runs for the
+            // whole app lifetime, independent of Start/Stop — the --very-light
+            // model is fetched once at launch by KeryxMinerApp.init().
+            if statusTimer == nil {
+                statusTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
+                    pollStatus()
+                }
+            }
+        }
     }
 
     func startMining() {
@@ -121,16 +137,9 @@ struct ContentView: View {
         }
         isMining = true
         logLines.append("Mining started — gRPC: \(addr)")
-
-        // Poll status every 2s
-        statusTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
-            pollStatus()
-        }
     }
 
     func stopMining() {
-        statusTimer?.invalidate()
-        statusTimer = nil
         keryx_miner_stop()
         isMining = false
         logLines.append("Mining stopped")
