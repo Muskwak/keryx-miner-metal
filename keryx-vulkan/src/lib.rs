@@ -93,6 +93,24 @@ impl Vk {
                 .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
                 .ok_or("no compute-capable queue family")? as u32;
 
+            // Query actual feature support before requesting anything. Drivers can advertise a
+            // Vulkan 1.2/1.3 apiVersion while still leaving individual *optional* core-1.2
+            // features unimplemented — bufferDeviceAddress in particular has had patchy mobile
+            // support even on recent flagship chips — so blindly enabling a bit gives an opaque
+            // "feature not present" at device-create time with no indication of which one.
+            let mut supported12 = vk::PhysicalDeviceVulkan12Features::default();
+            let mut supported_features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut supported12);
+            instance.get_physical_device_features2(pdevice, &mut supported_features2);
+            let has_int64 = supported_features2.features.shader_int64 == vk::TRUE;
+            let has_bda = supported12.buffer_device_address == vk::TRUE;
+            if !has_int64 || !has_bda {
+                instance.destroy_instance(None);
+                return Err(format!(
+                    "device '{device_name}' is missing required Vulkan feature(s): \
+                     shaderInt64={has_int64}, bufferDeviceAddress={has_bda}"
+                ));
+            }
+
             let priorities = [1.0f32];
             let qcis = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family)
