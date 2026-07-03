@@ -74,7 +74,7 @@ tasks.register<Exec>("cargoNdkBuild") {
         "cargo", "ndk",
         "-o", file("src/main/jniLibs").absolutePath,
         "-t", "arm64-v8a",
-        "-p", "26", // match android.defaultConfig.minSdk above
+        "-P", "26", // match android.defaultConfig.minSdk above
         "build", "--release",
     )
 }

@@ -49,7 +49,7 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
-          cargo ndk -o android-app/app/src/main/jniLibs -t arm64-v8a -p 26 build --release --manifest-path Cargo.toml
+          cargo ndk -o android-app/app/src/main/jniLibs -t arm64-v8a -P 26 build --release --manifest-path Cargo.toml
 
       - name: Verify native library exists
         run: find android-app/app/src/main/jniLibs -name "libkeryx_miner.so"
@@ -83,6 +83,11 @@ jobs:
 
       - name: Install Protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # The default (non-macOS/iOS/Android) target builds candle with the cuda feature, so cudarc's
+      # build script needs nvcc even though these tests never touch a real GPU (--skip gpu).
+      - name: Install CUDA toolkit (nvcc)
+        run: sudo apt-get install -y nvidia-cuda-toolkit
 
       - uses: dtolnay/rust-toolchain@stable
 
