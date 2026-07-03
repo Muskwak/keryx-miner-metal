@@ -17,8 +17,17 @@ android {
         versionName = "0.3.7"
     }
 
+    // Android refuses to install any unsigned APK, even via sideloading (unlike iOS's unsigned
+    // .ipa + on-device AltStore resign flow) — sign "release" with the auto-generated debug key
+    // so CI output is installable without a dedicated release keystore. There's no Play Store
+    // distribution here, so a stable release signature isn't needed.
+    signingConfigs {
+        getByName("debug") {}
+    }
+
     buildTypes {
         release {
+            signingConfig = signingConfigs.getByName("debug")
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
