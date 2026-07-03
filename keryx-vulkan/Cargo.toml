@@ -1,0 +1,11 @@
+[package]
+name = "keryx-vulkan"
+version = "0.1.0"
+edition = "2021"
+description = "Vulkan compute backend for the Keryx Android miner (PoM walk only)"
+license = "MIT/Apache-2.0"
+
+[dependencies]
+# ash is a thin, dynamically-loaded Vulkan binding — no Vulkan SDK needed to BUILD, only the
+# vulkan-1 loader (Android: libvulkan.so, shipped by the device's GPU driver) to RUN.
+ash = "0.38"

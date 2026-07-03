@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Vulkan compute (PoM walk) is required, not just optional — no point installing without it. -->
+    <uses-feature android:name="android.hardware.vulkan.compute" android:version="0" android:required="true" />
+    <uses-feature android:name="android.hardware.vulkan.level" android:version="1" android:required="true" />
+
+    <application
+        android:allowBackup="false"
+        android:label="Keryx Miner"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar"
+        android:usesCleartextTraffic="true">
+        <!-- Cleartext allowed: stratum+tcp/gRPC pool endpoints are typically plain TCP, same as
+             the desktop miner and iOS app — not a browser-facing HTTP surface. -->
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="Keryx Miner">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

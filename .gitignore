@@ -7,3 +7,11 @@ escrow_state.json
 
 target-hive/
 Cargo.lock
+
+# Android app: build outputs, machine-local SDK path, and the cargo-ndk-built .so (rebuilt via
+# `./gradlew :app:cargoNdkBuild`, not committed).
+android-app/.gradle/
+android-app/local.properties
+android-app/app/build/
+android-app/build/
+android-app/app/src/main/jniLibs/

@@ -1,0 +1,104 @@
+#version 460
+// Keryx Proof-of-Model walk — Vulkan compute port of `pom::walk_final` + `pom_block_seed`
+// + `pom_pow_value` + `le_leq`. BYTE-IDENTICAL to src/pom.rs (and thus to the node verifier and
+// the original CUDA `pom_mine.cu`): same mix64 folds, same little-endian word layout, same walk.
+//
+// One invocation == one nonce. Each invocation re-derives the block seed, walks K data-dependent
+// 32-byte chunks of the resident weight blob, folds to a 256-bit pow value, and — if it is <= the
+// target — records its batch offset via atomicMin so the host recovers the LOWEST winning nonce.
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference : require
+
+layout(local_size_x = 64) in; // portable default; not re-tuned for any specific Adreno/Mali wave width yet
+
+// A weight shard as little-endian u64 words, reached by its GPU device address (a buffer_reference
+// pointer) rather than a bound SSBO. The full blob for an 8B+ model is >4 GiB (past the
+// `maxStorageBufferRange` descriptor cap) and can't fit one allocation (>2 GiB `maxMemoryAllocationSize`
+// on AMD), so it's split into ≤1 GiB shards; each chunk is read from its shard's pointer. Canonical
+// chunk `off` (32 bytes) == the 4 words [off*4 .. off*4+4]; storing the raw GGUF quant bytes as u64[]
+// reproduces `u64::from_le_bytes(chunk[i*8..i*8+8])` exactly on a little-endian GPU.
+layout(std430, buffer_reference, buffer_reference_align = 8) readonly buffer Shard {
+    uint64_t words[];
+};
+
+// Lowest winning batch offset (nonce - start_nonce). Initialised to 0xFFFFFFFF by the host;
+// 0xFFFFFFFF on readback == "no winner in this batch".
+layout(std430, binding = 0) buffer Winner { uint offset; } OUT;
+
+// One GPU device address per weight shard, in shard order.
+layout(std430, binding = 1) readonly buffer ShardAddrs { uint64_t addr[]; } SHARDS;
+
+layout(push_constant) uniform Push {
+    uint64_t p0, p1, p2, p3;   // pre_pow_hash, as 4 LE u64 words
+    uint64_t t0, t1, t2, t3;   // target (256-bit LE), as 4 u64 words
+    uint64_t timestamp;        // header timestamp
+    uint64_t n_chunks;         // total canonical chunks in the weight blob
+    uint64_t start_nonce;      // first nonce of this batch
+    uint64_t shard_mask;       // chunks_per_shard - 1 (chunks_per_shard is a power of two)
+    uint k;                    // POM_WALK_STEPS (256)
+    uint batch;                // number of nonces in this dispatch
+    uint shard_shift;          // log2(chunks_per_shard)
+} pc;
+
+// splitmix64 finalizer — exactly `pom::mix64`. u64 multiply wraps (modular), matching wrapping_mul.
+uint64_t mix64(uint64_t x) {
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9UL;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebUL;
+    x ^= x >> 31;
+    return x;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.batch) {
+        return;
+    }
+    uint64_t nonce = pc.start_nonce + uint64_t(idx);
+
+    // pom_block_seed: mix64-fold of (nonce, timestamp, pre_pow_hash words).
+    uint64_t state = mix64(nonce ^ 0x4B65727978531UL);
+    state = mix64(state ^ pc.timestamp);
+    state = mix64(state ^ pc.p0);
+    state = mix64(state ^ pc.p1);
+    state = mix64(state ^ pc.p2);
+    state = mix64(state ^ pc.p3);
+
+    // walk_final: K data-dependent reads. off = state % n_chunks; fold the chunk; repeat.
+    // Map the chunk to its shard (shift) and in-shard chunk (mask), then address the 32-byte chunk
+    // by advancing that shard's buffer_reference pointer in 64-bit address space (`local * 32` stays
+    // within a ≤1 GiB shard). The array subscript stays a small constant — glslang requires a 32-bit
+    // index — so the wide arithmetic lives in the pointer, never the index.
+    uint64_t off = state % pc.n_chunks;
+    for (uint i = 0u; i < pc.k; ++i) {
+        uint shard = uint(off >> pc.shard_shift);
+        uint64_t local = off & pc.shard_mask;
+        Shard chunk = Shard(SHARDS.addr[shard] + local * 32UL); // 32 bytes per canonical chunk
+        uint64_t h = state;
+        h ^= chunk.words[0];
+        h ^= chunk.words[1];
+        h ^= chunk.words[2];
+        h ^= chunk.words[3];
+        state = mix64(h);
+        off = state % pc.n_chunks;
+    }
+
+    // pom_pow_value: 4 keyed mix64 folds → 256-bit LE value as words o0..o3 (o0 = bytes 0..8).
+    uint64_t o0 = mix64(state ^ pc.p0 ^ 0x9E3779B97F4A7C15UL);
+    uint64_t o1 = mix64(o0 ^ pc.p1 ^ 0xC2B2AE3D27D4EB4FUL);
+    uint64_t o2 = mix64(o1 ^ pc.p2 ^ 0x165667B19E3779F9UL);
+    uint64_t o3 = mix64(o2 ^ pc.p3 ^ 0xD6E8FEB86659FD93UL);
+
+    // le_leq(pow, target): unsigned 256-bit LE compare, most-significant word (o3) first.
+    bool le;
+    if (o3 != pc.t3) { le = o3 < pc.t3; }
+    else if (o2 != pc.t2) { le = o2 < pc.t2; }
+    else if (o1 != pc.t1) { le = o1 < pc.t1; }
+    else if (o0 != pc.t0) { le = o0 < pc.t0; }
+    else { le = true; }
+
+    if (le) {
+        atomicMin(OUT.offset, idx);
+    }
+}

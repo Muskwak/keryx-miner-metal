@@ -4,18 +4,19 @@ use std::error::Error as StdError;
 
 pub mod models;
 pub mod pom;
-// PoM GPU walk: CUDA backend on Linux/Windows rigs, Metal backend on Apple Silicon. Both
-// modules expose the same free-function surface (install/uninstall/is_installed/is_loading/
-// mine/current_tier/ensure_installed/set_mining_tier), so main.rs / miner.rs / slm.rs stay
-// backend-agnostic.
-// Apple targets (macOS + iOS) use the Metal PoM backend; every other target uses
-// the CUDA/PTX backend. Both expose the same free-function surface so callers stay
-// backend-agnostic. iOS is NOT macOS, so it must be included here explicitly or it
-// would fall through to the CUDA path (which can't build on iOS).
-#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+// PoM GPU walk: CUDA backend on Linux/Windows rigs, Metal backend on Apple Silicon, Vulkan
+// backend on Android. All three modules expose the same free-function surface
+// (install/uninstall/is_installed/is_loading/mine/current_tier/ensure_installed/
+// set_mining_tier/device_for_model), so main.rs / miner.rs / slm.rs / ios.rs / android.rs stay
+// backend-agnostic. iOS is NOT macOS and Android is neither, so each must be listed explicitly
+// here or it would fall through to the CUDA path (which can't build on either).
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
 pub mod pom_gpu;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 #[path = "pom_gpu_metal.rs"]
+pub mod pom_gpu;
+#[cfg(target_os = "android")]
+#[path = "pom_gpu_vulkan.rs"]
 pub mod pom_gpu;
 pub mod slm;
 pub mod xoshiro256starstar;
@@ -25,50 +26,52 @@ pub mod xoshiro256starstar;
 // one implementation instead of duplicating the wire format.
 pub mod statum_codec;
 
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "android"))]
 pub mod proto {
     #![allow(clippy::derive_partial_eq_without_eq)]
     tonic::include_proto!("protowire");
 }
 
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "android"))]
 pub mod target;
 
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "android"))]
 type Hash = target::Uint256;
 
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "android"))]
 pub mod pow;
 
 // Sync watch channel (Condvar-based) — lets the async gRPC receiver hand the
 // latest block template to the blocking GPU mining thread, coalescing so the
 // miner never falls behind. Same module the desktop binary uses (main.rs).
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "android"))]
 mod watch;
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub mod inference;
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub mod quantized_llama_split;
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub mod quantized_qwen3_split;
 
 #[cfg(target_os = "ios")]
 pub mod ios;
+#[cfg(target_os = "android")]
+pub mod android;
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 use libloading::{Library, Symbol};
 
 pub type Error = Box<dyn StdError + Send + Sync + 'static>;
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 #[derive(Default)]
 pub struct PluginManager {
     plugins: Vec<Box<dyn Plugin>>,
     loaded_libraries: Vec<Library>,
 }
 
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "android"))]
 #[derive(Default)]
 pub struct PluginManager {
     _private: (),
@@ -78,7 +81,7 @@ pub struct PluginManager {
  Plugin Manager class - allows inserting your own hashers
  Inspired by https://michael-f-bryan.github.io/rust-ffi-guide/dynamic_loading.html
 */
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 impl PluginManager {
     pub fn new() -> Self {
         Self { plugins: Vec::new(), loaded_libraries: Vec::new() }
@@ -150,7 +153,7 @@ impl PluginManager {
     }
 }
 
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "android"))]
 impl PluginManager {
     pub fn new() -> Self {
         Self { _private: () }
@@ -169,7 +172,7 @@ impl PluginManager {
     }
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub trait Plugin: Any + Send + Sync {
     fn name(&self) -> &'static str;
     fn enabled(&self) -> bool;
@@ -191,7 +194,7 @@ pub trait Worker {
     fn copy_output_to(&mut self, nonces: &mut Vec<u64>) -> Result<(), Error>;
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub fn load_plugins<'help>(
     app: clap::App<'help>,
     paths: &[String],

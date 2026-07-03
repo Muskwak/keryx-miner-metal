@@ -13,14 +13,14 @@ use crate::{
     target::{self, Uint256},
     Error, Hash,
 };
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "android"))]
 use crate::pom::{self, WeightIndex};
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 use keryx_miner::pom::{self, WeightIndex};
 
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "android"))]
 use crate::Worker;
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 use keryx_miner::Worker;
 
 mod hasher;

@@ -13,7 +13,9 @@ autobins = false
 [lib]
 name = "keryx_miner"
 path = "src/lib.rs"
-crate-type = ["lib", "staticlib"]
+# cdylib is for Android: JNI native libraries load as a shared object via System.loadLibrary.
+# Harmless extra build artifact on the other platforms (which use "lib"/"staticlib").
+crate-type = ["lib", "staticlib", "cdylib"]
 
 [[bin]]
 name = "keryx-miner"
@@ -71,14 +73,15 @@ flate2 = "1.0"
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
-# libloading (dlopen/dlsym) is not available on iOS — static linking only.
-# Gate it behind the full-desktop feature so the iOS staticlib crate-type compiles.
-[target.'cfg(not(target_os = "ios"))'.dependencies]
+# libloading (dlopen/dlsym) is not available on iOS or Android — both are static-linked-app-only
+# platforms with no desktop plugin system. Gate it behind the full-desktop feature so the
+# iOS/Android staticlib/cdylib crate-types compile.
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
 libloading = "0.7"
 
-# nix (UNIX signal handling, pthread_kill) is macOS/Linux only, not available on iOS.
-# On iOS the miner runs as a single-threaded foreground app; no freeze handler needed.
-[target.'cfg(not(target_os = "ios"))'.dependencies.nix]
+# nix (UNIX signal handling, pthread_kill) is for the desktop CLI's freeze handler — not used on
+# iOS or Android, which run as a single foreground app with no such handler.
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies.nix]
 version = "0.25"
 
 [features]
@@ -101,9 +104,12 @@ keccak = "0.1"
 
 # OPoI inference backend, chosen at build time. candle's `cuda` and `metal` features
 # are mutually exclusive backends: CUDA for NVIDIA rigs, Metal for Apple Silicon
-# (both macOS and iOS). On macOS the vendored `candle-kernels` patch below is unused
-# (it is CUDA-only) and cargo will emit a harmless "patch not used" warning.
-[target.'cfg(all(not(target_os = "macos"), not(target_os = "ios")))'.dependencies]
+# (both macOS and iOS). Android is excluded here too — candle has no Vulkan backend, so
+# Android runs candle on the plain CPU device (see the android-specific block below); it only
+# ever uses candle for GGUF parsing (building the PoM weight blob) and model downloads, never
+# GPU inference. On macOS the vendored `candle-kernels` patch below is unused (it is CUDA-only)
+# and cargo will emit a harmless "patch not used" warning.
+[target.'cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))'.dependencies]
 candle-core = { version = "0.9", features = ["cuda"] }
 candle-transformers = { version = "0.9", features = ["cuda"] }
 candle-nn = { version = "0.9", features = ["cuda"] }
@@ -121,6 +127,17 @@ candle-nn = { version = "0.9", features = ["metal"] }
 candle-metal-kernels = "0.9"
 objc2-metal = "0.3"
 
+# Android: plain CPU candle (default features, no cuda/metal/mkl/accelerate) — candle has no
+# Vulkan backend, so it's only used here to parse GGUF tensors (packing the PoM weight blob) and
+# model downloads, never GPU inference. Also: jni (android.rs's JNI bridge) and keryx-vulkan (the
+# PoM GPU walk, a vendored/trimmed port of the RDNA3 fork's desktop AMD Vulkan backend).
+[target.'cfg(target_os = "android")'.dependencies]
+candle-core = { version = "0.9" }
+candle-transformers = { version = "0.9" }
+candle-nn = { version = "0.9" }
+jni = "0.21"
+keryx-vulkan = { path = "keryx-vulkan" }
+
 [profile.release]
 lto = true
 codegen-units = 1
@@ -134,7 +151,7 @@ time = { version = "0.3", features = ["formatting"] }
 sha3 = { git = "https://github.com/elichai/hashes", branch = "cSHAKE" }
 
 [workspace]
-members = ["inference", "plugins/*"]
+members = ["inference", "plugins/*", "keryx-vulkan"]
 default-members = ["."]
 
 # Vendored candle patches:

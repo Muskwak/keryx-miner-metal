@@ -19,11 +19,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
 
     // PoM mining kernel → PTX (loaded at runtime into candle's CUDA context). nvcc 12.2 (PATH).
-    // Skipped on BOTH macOS and iOS: candle uses the Metal backend there (the Metal kernel is
-    // compiled in-process at runtime, tracked via the rerun-if-changed above), and requiring
-    // the CUDA toolchain just to produce an unused PTX would block every Apple build.
-    let is_apple = target_os == "macos" || target_os == "ios";
-    if !is_apple {
+    // Skipped on macOS, iOS, and Android: candle uses the Metal backend on Apple targets (the
+    // Metal kernel is compiled in-process at runtime, tracked via the rerun-if-changed above),
+    // and Android's PoM walk is the separate Vulkan backend (keryx-vulkan, compiled from its own
+    // build.rs). Requiring the CUDA toolchain just to produce an unused PTX would block every
+    // non-desktop build.
+    let skip_cuda_ptx = target_os == "macos" || target_os == "ios" || target_os == "android";
+    if !skip_cuda_ptx {
         println!("cargo:rerun-if-changed=cuda/pom_mine.cu");
         let out_dir = env::var("OUT_DIR").unwrap();
         let nvcc = env::var("NVCC").ok().unwrap_or_else(|| {
