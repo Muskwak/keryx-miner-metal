@@ -836,10 +836,21 @@ fn mining_worker(
             }
         }
 
-        let (index, tier) = match pom::active_index() {
+        // Upstream made PoM per-tier: resolve this block's tier (device 0), then
+        // fetch that tier's resident host index (an Arc). Mirrors the desktop
+        // worker (miner.rs): current_tier → active_index_for_tier → walk.
+        let tier = match pom_gpu::current_tier(0, daa) {
+            Some(t) => t,
+            None => {
+                log_msg("ios: ERROR current_tier() None after install — retrying");
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                continue;
+            }
+        };
+        let index = match pom::active_index_for_tier(tier) {
             Some(x) => x,
             None => {
-                log_msg("ios: ERROR active_index() None after install — retrying");
+                log_msg("ios: ERROR active_index_for_tier() None after install — retrying");
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 continue;
             }
@@ -876,7 +887,7 @@ fn mining_worker(
             // returns a seed of the *same variant* as this State's block:
             // FullBlock for gRPC, PartialBlock (with the borsh PoM proof) for
             // stratum. Either way the transport-specific forwarder handles it.
-            if let Some(seed) = s.generate_block_if_pom(winning_nonce, index, *tier) {
+            if let Some(seed) = s.generate_block_if_pom(winning_nonce, index.as_ref(), tier) {
                 NONCES_FOUND.fetch_add(1, Ordering::Relaxed);
                 let _ = submit_tx.blocking_send(seed);
             }
