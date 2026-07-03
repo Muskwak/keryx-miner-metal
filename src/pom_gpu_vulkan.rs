@@ -16,7 +16,7 @@
 //! under the device's real `maxMemoryAllocationSize`, queried at runtime — desktop AMD's ~2 GiB
 //! single-allocation cap doesn't hold on a phone GPU, which can report far less.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -100,22 +100,25 @@ pub fn device_for_model(model_id: &[u8; 32]) -> Option<u32> {
     g.iter().filter(|(_, (id, _))| id == model_id).map(|(dev, _)| *dev).min()
 }
 
-/// Models that failed to load on a given device: `(device_id, model_id)`. Once banlisted, that
-/// device never retries that model — avoids a hot-spin reloading a model that doesn't fit; the
-/// allocation-failure handler downgrades to a smaller downloaded tier instead.
-static OOM_BANLIST: OnceLock<Mutex<HashSet<(u32, [u8; 32])>>> = OnceLock::new();
+/// Models that failed to load on a given device: `(device_id, model_id) -> reason`. Once
+/// banlisted, that device never retries that model — avoids a hot-spin reloading a model that
+/// doesn't fit; the allocation-failure handler downgrades to a smaller downloaded tier instead.
+/// Keeping the reason (not just a `HashSet` membership bit) lets every retry re-log why, since the
+/// mining loop retries every 500ms and the original failure otherwise scrolls out of the on-screen
+/// log's last-20-lines window almost immediately.
+static OOM_BANLIST: OnceLock<Mutex<HashMap<(u32, [u8; 32]), String>>> = OnceLock::new();
 
-fn oom_banlist() -> &'static Mutex<HashSet<(u32, [u8; 32])>> {
-    OOM_BANLIST.get_or_init(|| Mutex::new(HashSet::new()))
+fn oom_banlist() -> &'static Mutex<HashMap<(u32, [u8; 32]), String>> {
+    OOM_BANLIST.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn is_oom_banlisted(device_id: u32, model_id: &[u8; 32]) -> bool {
-    oom_banlist().lock().map(|g| g.contains(&(device_id, *model_id))).unwrap_or(false)
+    oom_banlist().lock().map(|g| g.contains_key(&(device_id, *model_id))).unwrap_or(false)
 }
 
-fn oom_banlist_add(device_id: u32, model_id: [u8; 32]) {
+fn oom_banlist_add(device_id: u32, model_id: [u8; 32], reason: String) {
     if let Ok(mut g) = oom_banlist().lock() {
-        g.insert((device_id, model_id));
+        g.insert((device_id, model_id), reason);
     }
 }
 
@@ -172,6 +175,14 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
         None => return false,
     };
     if is_oom_banlisted(device_id, &model_id) {
+        if let Ok(g) = oom_banlist().lock() {
+            if let Some(reason) = g.get(&(device_id, model_id)) {
+                log::error!(
+                    "PoM(vulkan)[gpu{}]: model already banlisted, not retrying — {}",
+                    device_id, reason
+                );
+            }
+        }
         return false;
     }
     // Build this tier's possession index once (host, heavy) — shared across every device mining
@@ -227,7 +238,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                 "PoM(vulkan)[gpu{}]: device miner build failed: {} — banlisting this model and downgrading.",
                 device_id, e
             );
-            oom_banlist_add(device_id, model_id);
+            oom_banlist_add(device_id, model_id, format!("device miner build failed: {e}"));
             downgrade_after_oom(device_id, &model_id, daa);
             return false;
         }
@@ -237,7 +248,11 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                  banlisting this model and downgrading.",
                 device_id
             );
-            oom_banlist_add(device_id, model_id);
+            oom_banlist_add(
+                device_id,
+                model_id,
+                "device miner load panicked (likely an allocation failure)".to_string(),
+            );
             downgrade_after_oom(device_id, &model_id, daa);
             return false;
         }
