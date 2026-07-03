@@ -8,6 +8,12 @@ use crate::proto::{
     NotifyBlockAddedRequestMessage, NotifyNewBlockTemplateRequestMessage,
 };
 use crate::{miner::MinerManager, Error};
+
+/// Max AiRequest queue size — drop oldest when full to prevent unbounded memory growth.
+const MAX_AI_QUEUE_SIZE: usize = 64;
+/// Max unique stable-ids tracked for deduplication — evict when full.
+const MAX_AI_SEEN_IDS: usize = 10_000;
+
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use log::{error, info, warn};
@@ -343,6 +349,16 @@ impl KeryxdHandler {
                     info!("OPoI: queued AiRequest id={}", stable_id);
                     self.ai_seen_prefixes.insert(stable_id.clone());
                     self.ai_request_queue.push_back((stable_id.clone(), raw, model_id, prompt, max_tokens));
+                    while self.ai_request_queue.len() > MAX_AI_QUEUE_SIZE {
+                        self.ai_request_queue.pop_front();
+                    }
+                    while self.ai_seen_prefixes.len() > MAX_AI_SEEN_IDS {
+                        self.ai_seen_prefixes.clear();
+                        self.ai_seen_prefixes.shrink_to_fit();
+                        for (sid, _, _, _, _) in &self.ai_request_queue {
+                            self.ai_seen_prefixes.insert(sid.clone());
+                        }
+                    }
                 }
                 // Track txid for escrow claims. Prefer verbose_data.transaction_id when
                 // present, fall back to computing the txid from the transaction fields —
@@ -522,7 +538,7 @@ impl KeryxdHandler {
                 if let Some(block) = notif.block {
                     if !block.transactions.is_empty() {
                         // Full block — scan directly.
-                        self.scan_txs_for_ai_requests(&block.transactions.clone());
+                        self.scan_txs_for_ai_requests(&block.transactions);
                         self.try_start_inference();
                         // Escrow: check for new escrow UTXOs and mature claims.
                         let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
@@ -610,7 +626,7 @@ impl KeryxdHandler {
                     return Ok(());
                 }
                 if let Some(ref block) = template.block {
-                    self.scan_txs_for_ai_requests(&block.transactions.clone());
+                    self.scan_txs_for_ai_requests(&block.transactions);
                 }
                 self.try_start_inference();
                 // Pause GPU mining while any inference is in flight (GPU is occupied by the model).
@@ -637,7 +653,7 @@ impl KeryxdHandler {
                 if let Some(e) = msg.error {
                     warn!("GetBlockResponse error: {}", e.message);
                 } else if let Some(block) = msg.block {
-                    self.scan_txs_for_ai_requests(&block.transactions.clone());
+                    self.scan_txs_for_ai_requests(&block.transactions);
                     self.try_start_inference();
                     let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
                     if let Some(tx) = claim_tx {

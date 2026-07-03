@@ -1,6 +1,6 @@
 [package]
 name = "keryx-miner"
-version = "0.3.4"
+version = "0.3.7"
 edition = "2021"
 license = "MIT/Apache-2.0"
 repository = "https://github.com/keryx-labs/keryx-miner"
@@ -92,10 +92,11 @@ keccak = "0.1"
 kernel32-sys = "0.2"
 win32console = "0.1"
 
-# Keccak-f1600 for Apple Silicon: no assembly implementation for aarch64,
-# use the Rust keccak crate (same fallback as the `no-asm` feature and Windows).
-# macOS and iOS both use aarch64 Metal — same keccak fallback.
-[target.'cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")))'.dependencies]
+# On non-x86_64 targets (e.g. aarch64-apple-darwin / aarch64-apple-ios) the
+# hand-written keccakf1600 assembly in src/keccakf1600_x86-64*.s is unusable, so
+# fall back to the pure-Rust `keccak` crate. src/pow/keccak.rs selects this via
+# #[cfg]. Covers both macOS and iOS Metal builds.
+[target.'cfg(all(not(target_arch = "x86_64"), not(target_os = "windows")))'.dependencies]
 keccak = "0.1"
 
 # OPoI inference backend, chosen at build time. candle's `cuda` and `metal` features
@@ -113,7 +114,12 @@ candle-nn = { version = "0.9", features = ["cuda"] }
 candle-core = { version = "0.9", features = ["metal"] }
 candle-transformers = { version = "0.9", features = ["metal"] }
 candle-nn = { version = "0.9", features = ["metal"] }
-metal = "0.27"
+# candle 0.9 wraps Metal via `candle_metal_kernels::metal` (built on objc2-metal), not the
+# metal-rs crate. Depending on the same wrapper lets pom_gpu_metal.rs use the exact same
+# Device/Buffer/CommandQueue/ComputePipeline types candle already holds — no re-wrapping.
+# objc2-metal supplies MTLSize / MTLResourceOptions used in the compute dispatch below.
+candle-metal-kernels = "0.9"
+objc2-metal = "0.3"
 
 [profile.release]
 lto = true
@@ -131,9 +137,20 @@ sha3 = { git = "https://github.com/elichai/hashes", branch = "cSHAKE" }
 members = ["inference", "plugins/*"]
 default-members = ["."]
 
-# Vendored candle-kernels: the upstream MoE bf16 WMMA kernels only compile for
-# sm_80+, which would exclude Turing/Pascal (and thus all pre-Ampere miners) from
-# inference. The vendored copy guards those kernel bodies with `#if __CUDA_ARCH__
-# >= 800` so the crate builds at sm_75 (stub on older archs, real MoE on sm_80+).
+# Vendored candle patches:
+#   * candle-kernels — upstream MoE bf16 WMMA kernels only compile for sm_80+,
+#     which would exclude Turing/Pascal (and thus all pre-Ampere miners) from
+#     inference. The vendored copy guards those kernel bodies with
+#     `#if __CUDA_ARCH__ >= 800` so the crate builds at sm_75 (stub on older
+#     archs, real MoE on sm_80+).
+#   * candle-core — upstream keeps `QTensor::storage` private and returns an
+#     unimplemented `device_ptr` on the Metal branch, so the Metal PoM miner
+#     cannot see candle's own `MTLBuffer`s and would be forced to blit every
+#     tensor out of unified memory into a packed weight buffer. The vendored
+#     copy adds `QTensor::metal_storage(&self) -> Option<&QMetalStorage>` so
+#     the miner can build a bindless pointer table over the existing buffers
+#     and skip the copy. Linux/Windows CUDA builds keep the crates.io copy —
+#     cargo will emit a harmless "patch not used" warning there.
 [patch.crates-io]
 candle-kernels = { path = "vendor/candle-kernels" }
+candle-core = { path = "vendor/candle-core" }

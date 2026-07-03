@@ -62,6 +62,10 @@ struct CurrentTask {
 /// Shared inference result cache — persists across block changes so that if the
 /// same AiRequest is included in multiple consecutive job templates the miner can
 /// immediately submit with a CID once inference completed for the first occurrence.
+
+/// Max cached inference results — evict when full to prevent unbounded growth.
+const MAX_INFERENCE_CACHE_SIZE: usize = 1_000;
+
 struct InferenceCacheInner {
     /// stable_id → base58 CIDv0 string returned by IPFS after upload.
     results: HashMap<String, String>,
@@ -118,6 +122,8 @@ pub struct StratumHandler {
     send_channel: Sender<StratumLine>,
     stream: Pin<Box<dyn Stream<Item = Result<StratumLine, NewLineJsonCodecError>>>>,
     miner_address: String,
+    /// Pool worker name; the authorize username is `miner_address.worker` (empty = just the address).
+    worker: String,
     mine_when_not_synced: bool,
     devfund_address: Option<String>,
     devfund_percent: u16,
@@ -184,7 +190,13 @@ impl Client for StratumHandler {
             .send(StratumLine {
                 id,
                 payload: StratumLinePayload::StratumCommand(StratumCommand::Authorize((
-                    pay_address.clone(),
+                    // Pool username: `address.worker` (so the pool can tag shares per rig), or just
+                    // the address when no worker name is set.
+                    if self.worker.is_empty() {
+                        pay_address.clone()
+                    } else {
+                        format!("{}.{}", pay_address, self.worker)
+                    },
                     "x".into(),
                 ))),
                 jsonrpc: None,
@@ -241,6 +253,7 @@ impl StratumHandler {
     pub async fn connect(
         address: String,
         miner_address: String,
+        worker: String,
         mine_when_not_synced: bool,
         block_template_ctr: Option<Arc<AtomicU16>>,
         ipfs_url: String,
@@ -273,6 +286,7 @@ impl StratumHandler {
             stream: Box::pin(stream),
             send_channel,
             miner_address,
+            worker,
             mine_when_not_synced,
             devfund_address: None,
             devfund_percent: 0,
@@ -800,6 +814,10 @@ fn run_inference_and_upload(
     let mut guard = cache.blocking_lock();
     guard.in_progress.remove(&stable_id);
     if let Some(cid) = cid_opt {
+        if guard.results.len() >= MAX_INFERENCE_CACHE_SIZE {
+            guard.results.clear();
+            guard.results.shrink_to_fit();
+        }
         guard.results.insert(stable_id, cid);
     }
 }

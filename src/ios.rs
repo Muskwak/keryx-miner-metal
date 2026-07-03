@@ -202,7 +202,9 @@ fn ensure_mining_model_ready() -> bool {
     let Some(gguf_path) = download_model(spec) else {
         return false;
     };
-    pom_gpu::set_mining_tier(spec.model_id, gguf_path.to_string_lossy().into_owned());
+    // Upstream made PoM per-GPU: set_mining_tier is keyed by device_id. iOS is
+    // single-GPU (device 0).
+    pom_gpu::set_mining_tier(0, spec.model_id, gguf_path.to_string_lossy().into_owned());
     true
 }
 

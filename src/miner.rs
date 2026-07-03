@@ -2,15 +2,13 @@ use std::collections::HashMap;
 use std::num::Wrapping;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::sleep;
-use std::time::Duration;
+use std::thread::{self, sleep};
+use std::time::{Duration, Instant};
 
 use crate::{pow, watch, Error};
 use log::{error, info, warn};
 use rand::{thread_rng, RngCore};
 use tokio::sync::mpsc::Sender;
-use tokio::task::{self, JoinHandle};
-use tokio::time::MissedTickBehavior;
 
 use crate::pow::BlockSeed;
 use keryx_miner::{PluginManager, WorkerSpec};
@@ -93,7 +91,7 @@ pub struct MinerManager {
     handles: Vec<MinerHandler>,
     block_channel: watch::Sender<Option<WorkerCommand>>,
     send_channel: Sender<BlockSeed>,
-    logger_handle: JoinHandle<()>,
+    logger_stop: Arc<AtomicBool>,
     is_synced: bool,
     hashes_tried: Arc<AtomicU64>,
     hashes_by_worker: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
@@ -104,7 +102,9 @@ pub struct MinerManager {
 impl Drop for MinerManager {
     fn drop(&mut self) {
         info!("Closing miner");
-        self.logger_handle.abort();
+        // Signal the detached hashrate logger to exit on its next wake (it polls this flag). We
+        // don't join it — that would block shutdown up to LOG_RATE.
+        self.logger_stop.store(true, Ordering::Release);
         match self.block_channel.send(Some(WorkerCommand::Close)) {
             Ok(_) => {}
             Err(_) => warn!("All workers are already dead"),
@@ -157,33 +157,46 @@ impl MinerManager {
                 hashes_by_worker.clone(),
             ));
         }
-        // macOS has no GPU plugin, so no WorkerSpec is ever produced above. Launch
-        // the built-in Metal PoM worker (device 0) directly — mining is PoM-only,
-        // so launch_gpu_miner's PoM branch drives pom_gpu::mine and the worker's
-        // kHeavyHash stubs are never touched. set_mining_tier is already configured
-        // by the startup path (main.rs) before this runs.
+        // Apple Silicon builds no GPU plugin, so `has_specs()` is false and `launch_gpu_miner`
+        // never spawns — and that worker is the *only* caller of `pom_gpu::ensure_installed`, which
+        // builds the shared PoM weight index (`active_index`). Without it the miner could not mine
+        // PoM at all: not the Metal GPU walk, and not the CPU fallback (which also needs
+        // `active_index`). Spawn one dedicated Metal PoM worker on device 0 to drive the walk and
+        // bootstrap the index. Skipped if a plugin already registered a worker (it drives the Metal
+        // walk itself, since `pom_gpu::mine` resolves to the Metal backend on macOS).
         #[cfg(target_os = "macos")]
         {
-            let worker_hashes_tried = Arc::new(AtomicU64::new(0));
-            let spec: Box<dyn WorkerSpec> = Box::new(keryx_miner::metal_worker::MetalWorkerSpec);
-            hashes_by_worker.lock().unwrap().insert(spec.id(), worker_hashes_tried.clone());
-            handles.push(Self::launch_gpu_miner(
-                send_channel.clone(),
-                recv.clone(),
-                Arc::clone(&hashes_tried),
-                spec,
-                worker_hashes_tried,
-            ));
+            if !manager.has_specs() {
+                let worker_hashes_tried = Arc::new(AtomicU64::new(0));
+                hashes_by_worker
+                    .lock()
+                    .unwrap()
+                    .insert("#0 (Metal)".to_string(), Arc::clone(&worker_hashes_tried));
+                handles.push(Self::launch_metal_pom_miner(
+                    send_channel.clone(),
+                    recv.clone(),
+                    Arc::clone(&hashes_tried),
+                    worker_hashes_tried,
+                ));
+            }
         }
+        let logger_stop = Arc::new(AtomicBool::new(false));
+        let logger_stop_spawn = Arc::clone(&logger_stop);
+        // Clone the counters the logger reads BEFORE the move-closure, so the originals stay
+        // available for the struct fields below. The hashrate logger runs on a dedicated std::thread
+        // (not a tokio task) so it never occupies one of the few async workers; it is detached and
+        // exits on `logger_stop` (set in Drop) — no join (that would block shutdown up to LOG_RATE).
+        let logger_hashes = Arc::clone(&hashes_tried);
+        let logger_by_worker = hashes_by_worker.clone();
+        let logger_challenge = Arc::clone(&opoi_challenge_active);
+        thread::spawn(move || {
+            Self::log_hashrate(logger_hashes, logger_by_worker, logger_challenge, logger_stop_spawn)
+        });
         Self {
             handles,
             block_channel: send,
             send_channel,
-            logger_handle: task::spawn(Self::log_hashrate(
-                Arc::clone(&hashes_tried),
-                hashes_by_worker.clone(),
-                Arc::clone(&opoi_challenge_active),
-            )),
+            logger_stop,
             is_synced: true,
             hashes_tried,
             current_state_id: AtomicUsize::new(0),
@@ -322,10 +335,9 @@ impl MinerManager {
                         worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
                         if let Some(nonce) = found {
                             let built = state.as_ref().and_then(|s| {
-                                keryx_miner::pom::active_index().and_then(|(idx, _)| {
-                                    let tier = keryx_miner::pom_gpu::current_tier(s.daa_score)?;
-                                    s.generate_block_if_pom(nonce, idx, tier)
-                                })
+                                let tier = keryx_miner::pom_gpu::current_tier(worker_device_id, s.daa_score)?;
+                                let idx = keryx_miner::pom::active_index_for_tier(tier)?;
+                                s.generate_block_if_pom(nonce, idx.as_ref(), tier)
                             });
                             if let Some(block_seed) = built {
                                 match send_channel.blocking_send(block_seed.clone()) {
@@ -434,6 +446,98 @@ impl MinerManager {
         })
     }
 
+    /// Apple Silicon PoM worker. Apple Silicon loads no GPU plugin (so `has_specs()` is false and
+    /// `launch_gpu_miner` never spawns) and Metal has no kHeavyHash kernel, so this dedicated thread
+    /// drives the Metal PoM walk (`pom_gpu::mine`, which resolves to the Metal backend on macOS) and
+    /// bootstraps the shared host weight index via `ensure_installed`. It mirrors the PoM branch of
+    /// `launch_gpu_miner`; pre-PoM templates carry no GPU work here (kHeavyHash is CPU-only on
+    /// Apple Silicon), so they are skipped and left to the CPU workers.
+    #[cfg(target_os = "macos")]
+    #[allow(unreachable_code)]
+    fn launch_metal_pom_miner(
+        send_channel: Sender<BlockSeed>,
+        mut block_channel: watch::Receiver<Option<WorkerCommand>>,
+        hashes_tried: Arc<AtomicU64>,
+        worker_hashes_tried: Arc<AtomicU64>,
+    ) -> MinerHandler {
+        // Single Apple Silicon GPU. POM_BATCH must stay < u32::MAX — the Metal winner atomic is a
+        // 32-bit tid (see pom_gpu_metal.rs) — and mirrors the value used in launch_gpu_miner.
+        const DEVICE_ID: u32 = 0;
+        const POM_BATCH: u64 = 1 << 20;
+        std::thread::spawn(move || {
+            (|| {
+                let mut state: Option<Box<pow::State>> = None;
+                let mut pom_nonce: u64 = thread_rng().next_u64();
+                loop {
+                    if state.is_none() {
+                        state = match block_channel.wait_for_change() {
+                            Ok(Some(WorkerCommand::Job(s))) => Some(s),
+                            Ok(Some(WorkerCommand::Close)) => return Ok(()),
+                            Ok(None) => None,
+                            Err(e) => {
+                                info!("Metal PoM thread closing: {}", e.to_string());
+                                return Ok(());
+                            }
+                        };
+                    }
+                    // Metal only mines PoM. A pre-PoM template has no GPU path here, so drop it and
+                    // wait for the next one — the CPU workers cover pre-PoM kHeavyHash.
+                    if !matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::POM_ACTIVATION_DAA) {
+                        state = None;
+                        continue;
+                    }
+                    let (pph, time, target_le, daa) = {
+                        let s = state.as_ref().unwrap();
+                        let mut pph = [0u8; 32];
+                        pph.copy_from_slice(&s.pow_hash_header[0..32]);
+                        let time = u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap());
+                        (pph, time, s.target.to_le_bytes(), s.daa_score)
+                    };
+                    // An OPoI inference may have evicted the mining model (inference has priority).
+                    // Rebuild the walk — and, on the first PoM block, build the shared host index.
+                    if !keryx_miner::pom_gpu::is_installed(DEVICE_ID) {
+                        keryx_miner::pom_gpu::ensure_installed(DEVICE_ID, daa);
+                    }
+                    let found =
+                        keryx_miner::pom_gpu::mine(DEVICE_ID, &pph, time, &target_le, pom_nonce, POM_BATCH);
+                    pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
+                    hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
+                    worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
+                    if let Some(nonce) = found {
+                        // Rebuild the proof on the host (raw GGUF). `generate_block_if_pom` re-walks
+                        // and checks pow_value <= target, so a Metal/host byte divergence yields None
+                        // (no bad block is ever submitted) rather than an invalid block.
+                        let built = state.as_ref().and_then(|s| {
+                            let tier = keryx_miner::pom_gpu::current_tier(DEVICE_ID, s.daa_score)?;
+                            let idx = keryx_miner::pom::active_index_for_tier(tier)?;
+                            s.generate_block_if_pom(nonce, idx.as_ref(), tier)
+                        });
+                        if let Some(block_seed) = built {
+                            match send_channel.blocking_send(block_seed.clone()) {
+                                Ok(()) => block_seed.report_block(),
+                                Err(e) => error!("Failed submitting PoM block: ({})", e.to_string()),
+                            }
+                            if let BlockSeed::FullBlock(_) = block_seed {
+                                state = None;
+                            }
+                        }
+                    } else if let Some(cmd) = block_channel.get_changed()? {
+                        state = match cmd {
+                            Some(WorkerCommand::Job(ns)) => Some(ns),
+                            Some(WorkerCommand::Close) => return Ok(()),
+                            None => state,
+                        };
+                    }
+                }
+                Ok(())
+            })()
+            .map_err(|e: Error| {
+                error!("Metal PoM thread crashed: {}", e.to_string());
+                e
+            })
+        })
+    }
+
     #[allow(unreachable_code)]
     fn launch_cpu_miner(
         send_channel: Sender<BlockSeed>,
@@ -443,7 +547,10 @@ impl MinerManager {
         let mut nonce = Wrapping(thread_rng().next_u64());
         let mut mask = Wrapping(0);
         let mut fixed = Wrapping(0);
-        std::thread::spawn(move || {
+        std::thread::Builder::new()
+            .name("cpu-miner".into())
+            .stack_size(256 * 1024)
+            .spawn(move || {
             (|| {
                 let mut state = None;
 
@@ -475,9 +582,10 @@ impl MinerManager {
 
                     // PoM possession path (CPU) once active; else legacy kHeavyHash.
                     let found = if state_ref.daa_score >= keryx_miner::pom::POM_ACTIVATION_DAA {
-                        keryx_miner::pom::active_index().and_then(|(idx, _)| {
-                            let tier = keryx_miner::pom_gpu::current_tier(state_ref.daa_score)?;
-                            state_ref.generate_block_if_pom(nonce.0, idx, tier)
+                        // The CPU/fallback walk has no per-device tier assignment — mine whichever
+                        // tier's index is built (lowest present).
+                        keryx_miner::pom::any_active_index().and_then(|(tier, idx)| {
+                            state_ref.generate_block_if_pom(nonce.0, idx.as_ref(), tier)
                         })
                     } else {
                         state_ref.generate_block_if_pow(nonce.0)
@@ -513,23 +621,25 @@ impl MinerManager {
                 error!("CPU thread crashed: {}", e.to_string());
                 e
             })
-        })
+        }).expect("failed to spawn cpu-miner thread")
     }
 
-    async fn log_hashrate(
+    fn log_hashrate(
         hashes_tried: Arc<AtomicU64>,
         hashes_by_worker: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
         opoi_challenge_active: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
     ) {
-        let mut ticker = tokio::time::interval(LOG_RATE);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut last_instant = ticker.tick().await;
+        let mut last_instant = Instant::now();
         // Consecutive all-zero ticks while NOT in an OPoI inference pause.
         let mut zero_streak: u32 = 0;
-        loop {
-            let now = ticker.tick().await;
-            let duration = (now - last_instant).as_secs_f64();
-            last_instant = now;
+        while !stop.load(Ordering::Acquire) {
+            thread::sleep(LOG_RATE);
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            let duration = last_instant.elapsed().as_secs_f64();
+            last_instant = Instant::now();
             // PoM model (re)load also intentionally pauses PoW — treat it like an inference pause.
             let challenge_active = opoi_challenge_active.load(Ordering::Relaxed)
                 || keryx_miner::pom_gpu::is_loading();

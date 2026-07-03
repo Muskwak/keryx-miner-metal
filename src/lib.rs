@@ -4,6 +4,18 @@ use std::error::Error as StdError;
 
 pub mod models;
 pub mod pom;
+// PoM GPU walk: CUDA backend on Linux/Windows rigs, Metal backend on Apple Silicon. Both
+// modules expose the same free-function surface (install/uninstall/is_installed/is_loading/
+// mine/current_tier/ensure_installed/set_mining_tier), so main.rs / miner.rs / slm.rs stay
+// backend-agnostic.
+// Apple targets (macOS + iOS) use the Metal PoM backend; every other target uses
+// the CUDA/PTX backend. Both expose the same free-function surface so callers stay
+// backend-agnostic. iOS is NOT macOS, so it must be included here explicitly or it
+// would fall through to the CUDA path (which can't build on iOS).
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+pub mod pom_gpu;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[path = "pom_gpu_metal.rs"]
 pub mod pom_gpu;
 pub mod slm;
 pub mod xoshiro256starstar;
@@ -12,11 +24,6 @@ pub mod xoshiro256starstar;
 // so both the desktop binary's StratumHandler and the iOS stratum client share
 // one implementation instead of duplicating the wire format.
 pub mod statum_codec;
-
-// Built-in Metal GPU worker: macOS has no CUDA/OpenCL plugin to supply GPU
-// workers, so the desktop binary uses this to launch its PoM mining thread.
-#[cfg(target_os = "macos")]
-pub mod metal_worker;
 
 #[cfg(target_os = "ios")]
 pub mod proto {

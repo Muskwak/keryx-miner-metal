@@ -8,23 +8,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("cargo:rerun-if-changed=proto");
     println!("cargo:rerun-if-changed=src/keccakf1600_x86-64.s");
+    println!("cargo:rerun-if-changed=metal/pom_mine.metal");
     tonic_build::configure()
         .build_server(false)
         .compile(
             &["proto/rpc.proto", "proto/p2p.proto", "proto/messages.proto"],
             &["proto"],
         )?;
-
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
 
-    // PoM mining kernel → PTX (loaded at runtime into candle's CUDA context). nvcc 12.2.
-    // On macOS & iOS the Metal kernel (cuda/pom_mine.metal) is compiled at runtime via
-    // the Metal framework's in-process compiler; we only track changes for rebuild triggers.
+    // PoM mining kernel → PTX (loaded at runtime into candle's CUDA context). nvcc 12.2 (PATH).
+    // Skipped on BOTH macOS and iOS: candle uses the Metal backend there (the Metal kernel is
+    // compiled in-process at runtime, tracked via the rerun-if-changed above), and requiring
+    // the CUDA toolchain just to produce an unused PTX would block every Apple build.
     let is_apple = target_os == "macos" || target_os == "ios";
-    if is_apple {
-        println!("cargo:rerun-if-changed=cuda/pom_mine.metal");
-    }
     if !is_apple {
         println!("cargo:rerun-if-changed=cuda/pom_mine.cu");
         let out_dir = env::var("OUT_DIR").unwrap();
@@ -40,9 +38,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|e| panic!("nvcc ({nvcc}) failed to run: {e}"));
         assert!(status.success(), "nvcc failed to compile cuda/pom_mine.cu");
     }
-
-    // Keccak-f1600 assembly: x86_64 only. On ARM64 (Apple Silicon) the Rust keccak crate
-    // is used instead (activated as a dependency in Cargo.toml for aarch64 macOS).
+    // Keccak-f1600 assembly: x86_64 only. On ARM64 (Apple Silicon, macOS + iOS) the Rust
+    // keccak crate is used instead (activated as a dependency in Cargo.toml for non-x86_64).
     if target_arch == "x86_64" && target_os != "windows" && target_os != "macos" {
         cc::Build::new().flag("-c").file("src/keccakf1600_x86-64.s").compile("libkeccak.a");
     }
