@@ -75,6 +75,8 @@ tasks.register<Exec>("cargoNdkBuild") {
         "-o", file("src/main/jniLibs").absolutePath,
         "-t", "arm64-v8a",
         "-P", "26", // match android.defaultConfig.minSdk above
-        "build", "--release",
+        // --lib only: the workspace's [[bin]] (src/main.rs) calls desktop/CUDA-only functions
+        // that are cfg'd out on Android.
+        "build", "--release", "--lib",
     )
 }

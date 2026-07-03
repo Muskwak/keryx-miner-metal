@@ -42,10 +42,13 @@ jobs:
             target/
           key: ${{ runner.os }}-android-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      # --lib only: the workspace's [[bin]] (src/main.rs, the desktop CLI) calls desktop/CUDA-only
+      # functions (query_all_gpus_vram, load_plugins) that are cfg'd out on Android — mirrors how
+      # build-apple.yml's iOS job also builds `--lib` only, never the bin, for the same reason.
       - name: Build Rust cdylib (arm64-v8a)
         run: |
           export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
-          cargo ndk -o android-app/app/src/main/jniLibs -t arm64-v8a -P 26 build --release --manifest-path Cargo.toml
+          cargo ndk -o android-app/app/src/main/jniLibs -t arm64-v8a -P 26 build --release --lib --manifest-path Cargo.toml
 
       - name: Verify native library exists
         run: find android-app/app/src/main/jniLibs -name "libkeryx_miner.so"
@@ -86,6 +89,12 @@ jobs:
         run: sudo apt-get install -y nvidia-cuda-toolkit
 
       - uses: dtolnay/rust-toolchain@stable
+
+      # No GPU on this runner, so candle-kernels' bindgen_cuda build script can't autodetect the
+      # compute capability via `nvidia-smi`. Force a value — it only affects which kernel variants
+      # get code-genned, not correctness of these CPU-side tests.
+      - name: Set CUDA_COMPUTE_CAP (no GPU on runner, skip nvidia-smi autodetect)
+        run: echo "CUDA_COMPUTE_CAP=86" >> "$GITHUB_ENV"
 
       - name: Cache Cargo
         uses: actions/cache@v4
