@@ -27,13 +27,10 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk
 
-      - name: Set up Android NDK
-        uses: nttld/setup-ndk@v1
-        id: setup-ndk
-        with:
-          ndk-version: r27
-          local-cache: true
-
+      # ubuntu-latest's runner image ships an Android SDK + NDK preinstalled (ANDROID_NDK_ROOT
+      # already points at a real, working r27 toolchain). A prior attempt used nttld/setup-ndk to
+      # fetch a second copy, but that action's download landed with a missing clang binary — so
+      # just point cargo-ndk at the runner's own preinstalled NDK instead.
       - name: Cache Cargo
         uses: actions/cache@v4
         with:
@@ -46,9 +43,8 @@ jobs:
           key: ${{ runner.os }}-android-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build Rust cdylib (arm64-v8a)
-        env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
           cargo ndk -o android-app/app/src/main/jniLibs -t arm64-v8a -P 26 build --release --manifest-path Cargo.toml
 
       - name: Verify native library exists
