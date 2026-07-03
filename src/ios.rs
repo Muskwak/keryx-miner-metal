@@ -32,8 +32,11 @@ const DIFFICULTY_1_TARGET: (u64, i16) = (0xffffu64, 208);
 /// daa_score-carrying notifies (ShortV2/WithTask) — required for the PoM branch.
 const KERYX_STRATUM_DAA_CAPABILITY: &str = "keryx-stratum-v2";
 
-static GRPC_ADDRESS: OnceLock<String> = OnceLock::new();
-static MINING_ADDRESS: OnceLock<String> = OnceLock::new();
+// Mutex<Option<String>>, not OnceLock<String> — the user can reconnect with a different address
+// after a Stop, and OnceLock::set silently no-ops after the first call, which would leave every
+// later reconnect stuck on whatever address was used first.
+static GRPC_ADDRESS: Mutex<Option<String>> = Mutex::new(None);
+static MINING_ADDRESS: Mutex<Option<String>> = Mutex::new(None);
 static NONCES_FOUND: AtomicU64 = AtomicU64::new(0);
 static LAST_LOG: OnceLock<Mutex<String>> = OnceLock::new();
 static RUNNING: AtomicBool = AtomicBool::new(false);
@@ -260,7 +263,7 @@ pub extern "C" fn keryx_miner_connect(address: *const std::ffi::c_char) -> bool 
         Ok(s) => s.to_string(),
         Err(_) => return false,
     };
-    let _ = GRPC_ADDRESS.set(addr);
+    *GRPC_ADDRESS.lock().unwrap() = Some(addr);
     log_msg(&format!("ios: gRPC address set"));
     true
 }
@@ -272,7 +275,7 @@ pub extern "C" fn keryx_miner_set_mining_address(address: *const std::ffi::c_cha
         Ok(s) => s.to_string(),
         Err(_) => return false,
     };
-    let _ = MINING_ADDRESS.set(addr);
+    *MINING_ADDRESS.lock().unwrap() = Some(addr);
     true
 }
 
@@ -282,11 +285,18 @@ pub extern "C" fn keryx_miner_start() -> bool {
     if RUNNING.swap(true, Ordering::SeqCst) {
         return false;
     }
-    let address = match GRPC_ADDRESS.get() {
-        Some(a) => a.clone(),
-        None => return false,
+    let address = match GRPC_ADDRESS.lock().unwrap().clone() {
+        Some(a) => a,
+        None => {
+            RUNNING.store(false, Ordering::SeqCst);
+            return false;
+        }
     };
-    let mining_addr = MINING_ADDRESS.get().cloned().unwrap_or_else(|| "keryx:ios:miner".into());
+    let mining_addr = MINING_ADDRESS
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| "keryx:ios:miner".into());
     let (stop_tx, stop_rx) = watch::channel(false);
     let _ = STOP_TX.set(stop_tx);
 

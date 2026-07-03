@@ -31,8 +31,11 @@ use crate::target::Uint256;
 const DIFFICULTY_1_TARGET: (u64, i16) = (0xffffu64, 208);
 const KERYX_STRATUM_DAA_CAPABILITY: &str = "keryx-stratum-v2";
 
-static GRPC_ADDRESS: OnceLock<String> = OnceLock::new();
-static MINING_ADDRESS: OnceLock<String> = OnceLock::new();
+// Mutex<Option<String>>, not OnceLock<String> — the user can reconnect with a different address
+// after a Stop, and OnceLock::set silently no-ops after the first call, which would leave every
+// later reconnect stuck on whatever address was used first.
+static GRPC_ADDRESS: Mutex<Option<String>> = Mutex::new(None);
+static MINING_ADDRESS: Mutex<Option<String>> = Mutex::new(None);
 static NONCES_FOUND: AtomicU64 = AtomicU64::new(0);
 static LAST_LOG: OnceLock<Mutex<String>> = OnceLock::new();
 static RUNNING: AtomicBool = AtomicBool::new(false);
@@ -206,13 +209,13 @@ fn download_model(spec: &ModelSpec) -> Option<std::path::PathBuf> {
 }
 
 fn connect_impl(address: &str) -> bool {
-    let _ = GRPC_ADDRESS.set(address.to_string());
+    *GRPC_ADDRESS.lock().unwrap() = Some(address.to_string());
     log_msg("android: gRPC/stratum address set");
     true
 }
 
 fn set_mining_address_impl(address: &str) -> bool {
-    let _ = MINING_ADDRESS.set(address.to_string());
+    *MINING_ADDRESS.lock().unwrap() = Some(address.to_string());
     true
 }
 
@@ -221,11 +224,18 @@ fn start_impl() -> bool {
     if RUNNING.swap(true, Ordering::SeqCst) {
         return false;
     }
-    let address = match GRPC_ADDRESS.get() {
-        Some(a) => a.clone(),
-        None => return false,
+    let address = match GRPC_ADDRESS.lock().unwrap().clone() {
+        Some(a) => a,
+        None => {
+            RUNNING.store(false, Ordering::SeqCst);
+            return false;
+        }
     };
-    let mining_addr = MINING_ADDRESS.get().cloned().unwrap_or_else(|| "keryx:android:miner".into());
+    let mining_addr = MINING_ADDRESS
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| "keryx:android:miner".into());
     let (stop_tx, stop_rx) = watch::channel(false);
     let _ = STOP_TX.set(stop_tx);
 
