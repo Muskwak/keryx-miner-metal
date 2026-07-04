@@ -43,8 +43,10 @@ fn main() {
         let spv = out_dir.join(format!("{stem}.spv"));
         println!("cargo:rerun-if-changed={}", path.display());
 
-        // vulkan1.2 (not 1.3): the Android PoM walk only needs shaderInt64 + bufferDeviceAddress,
-        // both core by Vulkan 1.2 — matching the lower device requirement in src/lib.rs's Vk::new().
+        // vulkan1.2 (not 1.3): the Android PoM walk needs at most shaderInt64 + bufferDeviceAddress
+        // (pom_walk.comp) or just bufferDeviceAddress (pom_walk_i32.comp, the shaderInt64-less
+        // fallback) — both core by Vulkan 1.2. Matches the device requirement in src/lib.rs's
+        // Vk::new(), which picks between the two variants based on a runtime feature query.
         let status = Command::new(&glslc)
             .args(["-O", "--target-env=vulkan1.2"])
             .arg(&path)

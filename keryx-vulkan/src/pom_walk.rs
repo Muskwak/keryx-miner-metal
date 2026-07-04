@@ -1,21 +1,35 @@
 //! GPU Proof-of-Model walk: dispatch the `pom_walk` compute shader over a resident weight blob to
 //! find the lowest nonce in a batch whose `pom_pow_value <= target`. The folds are byte-identical
 //! to `src/pom.rs`, so a nonce found here builds a `PomProof` the node accepts.
+//!
+//! Two shader variants, picked at runtime by [`Vk::supports_shader_int64`]:
+//!   - `pom_walk.comp` — native `uint64_t` arithmetic. Used whenever the device supports it (all
+//!     desktop AMD/NVIDIA GPUs, and some mobile GPUs).
+//!   - `pom_walk_i32.comp` — the same math hand-emulated over `uvec2` (lo, hi) pairs. Used when
+//!     `shaderInt64` is unavailable (confirmed missing on Qualcomm Adreno 740 by direct device
+//!     query, despite otherwise-modern Vulkan 1.3 support). Costs more ALU work per nonce, so it's
+//!     only used where the native path genuinely isn't an option.
+//!
+//! Both variants read/write the exact same byte layout for the weight blob and shard address
+//! table (a little-endian `uint64_t` and a `uvec2(lo, hi)` occupy the same 8 bytes), so the host
+//! side only needs to change how the *push constants* are packed, not how buffers are uploaded.
 
 use crate::{GpuBuffer, Kernel, Vk};
 use std::io::Cursor;
 
-/// SPIR-V for the PoM walk, compiled from `shaders/pom_walk.comp` by build.rs.
+/// SPIR-V for the native (`uint64_t`) PoM walk variant, compiled from `shaders/pom_walk.comp`.
 const POM_WALK_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_walk.spv"));
+/// SPIR-V for the `shaderInt64`-less (`uvec2`-emulated) variant, from `shaders/pom_walk_i32.comp`.
+const POM_WALK_I32_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_walk_i32.spv"));
 
 /// POM_WALK_STEPS — must match `pom::POM_WALK_STEPS` and the node.
 pub const POM_WALK_STEPS: u32 = 256;
 
-/// Push-constant block — layout MUST match the `Push` block in `pom_walk.comp` (std430: twelve u64
-/// at 0..96, then three u32 at 96, 100, 104; total 112 bytes incl. tail pad). The weight blob is
-/// split into power-of-two-sized shards (each a separate device-address buffer, ≤ the 2 GiB
-/// `maxMemoryAllocationSize`); the shader maps a chunk to its shard via `shard_shift`/`shard_mask`
-/// and reads the shard's GPU address from a small bound address table.
+/// Native push-constant block — layout MUST match the `Push` block in `pom_walk.comp` (std430:
+/// twelve u64 at 0..96, then three u32 at 96, 100, 104; total 112 bytes incl. tail pad). The weight
+/// blob is split into power-of-two-sized shards (each a separate device-address buffer, sized to
+/// the device's real `maxMemoryAllocationSize`); the shader maps a chunk to its shard via
+/// `shard_shift`/`shard_mask` and reads the shard's GPU address from a small bound address table.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PomPush {
@@ -30,6 +44,34 @@ struct PomPush {
     shard_shift: u32, // log2(chunks_per_shard)
 }
 
+/// Emulated push-constant block — layout MUST match the `Push` block in `pom_walk_i32.comp`.
+/// Every field that's a genuine arbitrary 64-bit value (hash/target words, timestamp, nonce) is a
+/// `[u32; 2]` (lo, hi) pair; `n_chunks`/`shard_mask` fit in `u32` for any realistic model (see the
+/// shader's `mod64` comment) and stay plain `u32`, same as `k`/`batch`/`shard_shift`. All ten pair
+/// fields are declared first (each naturally 8-byte-aligned when packed from offset 0) followed by
+/// the five plain `u32` fields, so this repr(C) layout matches GLSL's std430 push-constant layout
+/// byte-for-byte without needing an explicit `#[repr(align(8))]` wrapper — see the compile-time
+/// size assertion below, which would catch any future reordering that broke this.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PomPush32 {
+    p: [[u32; 2]; 4],
+    t: [[u32; 2]; 4],
+    timestamp: [u32; 2],
+    start_nonce: [u32; 2],
+    n_chunks: u32,
+    shard_mask: u32,
+    k: u32,
+    batch: u32,
+    shard_shift: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<PomPush32>() == 100);
+
+fn split_u64(v: u64) -> [u32; 2] {
+    [(v & 0xFFFF_FFFF) as u32, (v >> 32) as u32]
+}
+
 const NO_WINNER: u32 = 0xFFFF_FFFF;
 
 /// Chunks per shard: 2^25 × 32 B = 1 GiB, comfortably under the AMD 2 GiB `maxMemoryAllocationSize`
@@ -42,6 +84,12 @@ const SHARD_CHUNKS: u64 = 1 << 25;
 /// 65,536 keeps each dispatch to a few ms on device-local VRAM while staying far above launch cost.
 const MAX_DISPATCH_NONCES: u32 = 1 << 16;
 
+/// `mod64`'s binary long division (in `pom_walk_i32.comp`) assumes the divisor (`n_chunks`) is
+/// strictly less than 2^31 — see that shader's comment. 2^31 32-byte chunks would be a ~64 GiB
+/// weight blob, far beyond anything this miner ever loads, but the guard is here so a future
+/// pathological input fails loudly instead of silently mis-mining.
+const MAX_N_CHUNKS_FOR_I32_MOD: u64 = 1 << 31;
+
 /// Resident GPU PoM miner: the weight blob lives in a storage buffer; `mine` re-dispatches the
 /// walk over nonce batches. Build once per mining tier (the weight blob is large).
 pub struct PomWalkGpu {
@@ -52,11 +100,12 @@ pub struct PomWalkGpu {
     winner: GpuBuffer,
     n_chunks: u64,
     shard_chunks: u64,
+    use_i32: bool, // true: shaderInt64-less emulated variant; false: native uint64_t variant
 }
 
 impl PomWalkGpu {
     /// Upload the canonical weight blob (`weight_words` = the model's quant bytes as little-endian
-    /// u64 words, `n_chunks * 4` of them) and compile the walk kernel on the RDNA3 GPU.
+    /// u64 words, `n_chunks * 4` of them) and compile the walk kernel on the GPU.
     pub fn new(weight_words: &[u64], n_chunks: u64) -> Result<Self, String> {
         Self::new_sharded(weight_words, n_chunks, SHARD_CHUNKS)
     }
@@ -76,10 +125,21 @@ impl PomWalkGpu {
             return Err(format!("shard_chunks must be a power of two, got {shard_chunks}"));
         }
         let vk = Vk::new()?;
-        let spirv = ash::util::read_spv(&mut Cursor::new(POM_WALK_SPV)).map_err(|e| e.to_string())?;
+        let use_i32 = !vk.supports_shader_int64();
+        if use_i32 && n_chunks >= MAX_N_CHUNKS_FOR_I32_MOD {
+            return Err(format!(
+                "n_chunks={n_chunks} exceeds the shaderInt64-less shader's mod64 limit ({MAX_N_CHUNKS_FOR_I32_MOD})"
+            ));
+        }
+        let (spv_bytes, push_size) = if use_i32 {
+            (POM_WALK_I32_SPV, std::mem::size_of::<PomPush32>() as u32)
+        } else {
+            (POM_WALK_SPV, std::mem::size_of::<PomPush>() as u32)
+        };
+        let spirv = ash::util::read_spv(&mut Cursor::new(spv_bytes)).map_err(|e| e.to_string())?;
         // Two descriptor bindings: the winner buffer and the shard address table. The (large) weight
         // shards are reached by device address, not bound as descriptors.
-        let kernel = vk.make_kernel(&spirv, 2, std::mem::size_of::<PomPush>() as u32)?;
+        let kernel = vk.make_kernel(&spirv, 2, push_size)?;
 
         // Split the blob on chunk boundaries into device-address shards; collect their GPU addresses.
         let n_shards = n_chunks.div_ceil(shard_chunks);
@@ -101,7 +161,7 @@ impl PomWalkGpu {
         vk.write_buffer(&addr_table, words_as_bytes(&addrs));
         let winner = vk.create_buffer(4)?;
 
-        Ok(Self { vk, kernel, shards, addr_table, winner, n_chunks, shard_chunks })
+        Ok(Self { vk, kernel, shards, addr_table, winner, n_chunks, shard_chunks, use_i32 })
     }
 
     /// Name of the GPU the miner is running on.
@@ -124,19 +184,40 @@ impl PomWalkGpu {
         while done < batch {
             let sub = (batch - done).min(MAX_DISPATCH_NONCES);
             self.vk.write_buffer(&self.winner, &NO_WINNER.to_le_bytes());
-            let push = PomPush {
-                p: words4(pre_pow_hash),
-                t: words4(target_le),
-                timestamp,
-                n_chunks: self.n_chunks,
-                start_nonce: start + done as u64,
-                shard_mask: self.shard_chunks - 1,
-                k: POM_WALK_STEPS,
-                batch: sub,
-                shard_shift: self.shard_chunks.trailing_zeros(),
-            };
+            let start_nonce = start + done as u64;
+            let shard_mask = self.shard_chunks - 1;
+            let shard_shift = self.shard_chunks.trailing_zeros();
+
             let groups = sub.div_ceil(64); // local_size_x = 64
-            self.vk.dispatch(&self.kernel, &[&self.winner, &self.addr_table], push_bytes(&push), groups);
+            if self.use_i32 {
+                let p = words4(pre_pow_hash);
+                let t = words4(target_le);
+                let push = PomPush32 {
+                    p: [split_u64(p[0]), split_u64(p[1]), split_u64(p[2]), split_u64(p[3])],
+                    t: [split_u64(t[0]), split_u64(t[1]), split_u64(t[2]), split_u64(t[3])],
+                    timestamp: split_u64(timestamp),
+                    start_nonce: split_u64(start_nonce),
+                    n_chunks: self.n_chunks as u32,
+                    shard_mask: shard_mask as u32,
+                    k: POM_WALK_STEPS,
+                    batch: sub,
+                    shard_shift,
+                };
+                self.vk.dispatch(&self.kernel, &[&self.winner, &self.addr_table], push_bytes(&push), groups);
+            } else {
+                let push = PomPush {
+                    p: words4(pre_pow_hash),
+                    t: words4(target_le),
+                    timestamp,
+                    n_chunks: self.n_chunks,
+                    start_nonce,
+                    shard_mask,
+                    k: POM_WALK_STEPS,
+                    batch: sub,
+                    shard_shift,
+                };
+                self.vk.dispatch(&self.kernel, &[&self.winner, &self.addr_table], push_bytes(&push), groups);
+            }
 
             let mut out = [0u8; 4];
             self.vk.read_buffer(&self.winner, &mut out);
@@ -173,6 +254,6 @@ fn words_as_bytes(words: &[u64]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, std::mem::size_of_val(words)) }
 }
 
-fn push_bytes(p: &PomPush) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(p as *const PomPush as *const u8, std::mem::size_of::<PomPush>()) }
+fn push_bytes<T>(p: &T) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(p as *const T as *const u8, std::mem::size_of::<T>()) }
 }

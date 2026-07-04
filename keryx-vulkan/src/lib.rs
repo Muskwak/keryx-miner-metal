@@ -5,9 +5,10 @@
 //!   - dropped `khh` (legacy kHeavyHash PoW) and the `bench` micro-benchmark module — both are
 //!     dead weight on Android, which only ever mines PoM (the legacy pre-fork lineup is gone);
 //!   - requests Vulkan **1.2** instead of 1.3 and drops `shaderIntegerDotProduct` — that feature
-//!     existed only to serve `khh`'s packed-dot kernel. The PoM walk itself needs nothing beyond
-//!     `shaderInt64` (core since 1.0) and `bufferDeviceAddress` (core in 1.2), which is much more
-//!     broadly supported across mid-range mobile GPUs than a full Vulkan 1.3 device.
+//!     existed only to serve `khh`'s packed-dot kernel. The PoM walk itself needs only
+//!     `bufferDeviceAddress` (core in 1.2) unconditionally; `shaderInt64` (core since 1.0, but
+//!     confirmed *unsupported* on a real Adreno 740 despite Vulkan 1.3 conformance) is used when
+//!     available and emulated in 32-bit arithmetic when it isn't — see `pom_walk.rs`.
 //!
 //! `ash` loads `vulkan-1` (Android: `libvulkan.so`) at runtime — no Vulkan SDK needed to build or
 //! run, only the loader that ships with the device's GPU driver. Fully headless/surfaceless: no
@@ -45,6 +46,7 @@ pub struct Vk {
     mem_props: vk::PhysicalDeviceMemoryProperties,
     cmd_pool: vk::CommandPool,
     device_name: String,
+    shader_int64: bool,
 }
 
 impl Vk {
@@ -95,19 +97,21 @@ impl Vk {
 
             // Query actual feature support before requesting anything. Drivers can advertise a
             // Vulkan 1.2/1.3 apiVersion while still leaving individual *optional* core-1.2
-            // features unimplemented — bufferDeviceAddress in particular has had patchy mobile
-            // support even on recent flagship chips — so blindly enabling a bit gives an opaque
-            // "feature not present" at device-create time with no indication of which one.
+            // features unimplemented — confirmed on a real Adreno 740 (Snapdragon 8 Gen 2), which
+            // supports bufferDeviceAddress but NOT shaderInt64 despite Vulkan 1.3 conformance.
+            // bufferDeviceAddress has no fallback (hard requirement, since the weight blob can
+            // exceed maxStorageBufferRange); shaderInt64 is optional — pom_walk.rs picks the
+            // native (fast) or `_i32` (shaderInt64-less, emulated 64-bit arithmetic) shader
+            // variant based on `Vk::supports_shader_int64()`.
             let mut supported12 = vk::PhysicalDeviceVulkan12Features::default();
             let mut supported_features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut supported12);
             instance.get_physical_device_features2(pdevice, &mut supported_features2);
             let has_int64 = supported_features2.features.shader_int64 == vk::TRUE;
             let has_bda = supported12.buffer_device_address == vk::TRUE;
-            if !has_int64 || !has_bda {
+            if !has_bda {
                 instance.destroy_instance(None);
                 return Err(format!(
-                    "device '{device_name}' is missing required Vulkan feature(s): \
-                     shaderInt64={has_int64}, bufferDeviceAddress={has_bda}"
+                    "device '{device_name}' is missing required Vulkan feature: bufferDeviceAddress"
                 ));
             }
 
@@ -115,7 +119,7 @@ impl Vk {
             let qcis = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family)
                 .queue_priorities(&priorities)];
-            let features = vk::PhysicalDeviceFeatures::default().shader_int64(true);
+            let features = vk::PhysicalDeviceFeatures::default().shader_int64(has_int64);
             let mut features12 = vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true);
             let dci = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&qcis)
@@ -145,6 +149,7 @@ impl Vk {
                 mem_props,
                 cmd_pool,
                 device_name,
+                shader_int64: has_int64,
             })
         }
     }
@@ -152,6 +157,13 @@ impl Vk {
     /// Human-readable name of the selected GPU (e.g. "Adreno (TM) 740").
     pub fn device_name(&self) -> &str {
         &self.device_name
+    }
+
+    /// Whether this device's driver actually supports `shaderInt64` (queried, not assumed —
+    /// several modern mobile GPUs, e.g. Adreno, don't implement this optional Vulkan 1.0 feature).
+    /// `pom_walk.rs` uses this to pick between the native and `_i32`-emulated shader variants.
+    pub fn supports_shader_int64(&self) -> bool {
+        self.shader_int64
     }
 
     /// Total device-local memory (MiB) = the largest `DEVICE_LOCAL` heap. On a UMA mobile GPU this

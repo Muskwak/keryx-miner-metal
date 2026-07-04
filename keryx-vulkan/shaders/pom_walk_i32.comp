@@ -1,0 +1,174 @@
+#version 460
+// Keryx Proof-of-Model walk — Vulkan compute port of `pom::walk_final` + `pom_block_seed`
+// + `pom_pow_value` + `le_leq`. BYTE-IDENTICAL to src/pom.rs (and thus to the node verifier and
+// the original CUDA `pom_mine.cu`): same mix64 folds, same little-endian word layout, same walk.
+//
+// One invocation == one nonce. Each invocation re-derives the block seed, walks K data-dependent
+// 32-byte chunks of the resident weight blob, folds to a 256-bit pow value, and — if it is <= the
+// target — records its batch offset via atomicMin so the host recovers the LOWEST winning nonce.
+//
+// NO NATIVE 64-BIT INTEGERS — this is the fallback variant for devices without `shaderInt64`
+// (confirmed missing on Qualcomm Adreno 740 by direct device query, despite otherwise-modern
+// Vulkan 1.3 support; `pom_walk.comp` is used instead wherever shaderInt64 IS available, since this
+// variant's emulated arithmetic costs meaningfully more ALU work per nonce). Every u64 value here
+// is a `uvec2` (x = low 32 bits, y = high 32 bits — the same byte layout an actual little-endian
+// `uint64_t` would have, so the host-uploaded weight blob and shard address table need no
+// repacking), and all arithmetic (xor/add/shift/multiply/modulo) is hand-emulated below.
+// `bufferDeviceAddress` (via `GL_EXT_buffer_reference`) is a SEPARATE, supported feature —
+// `GL_EXT_buffer_reference_uvec2` lets a reference be constructed from a `uvec2` instead of a
+// `uint64_t`, which is the one thing that would otherwise require Int64.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 64) in; // portable default; not re-tuned for any specific Adreno/Mali wave width yet
+
+// A weight shard as little-endian u64 words — represented as uvec2(lo, hi) pairs, reached by its
+// GPU device address (a buffer_reference pointer) rather than a bound SSBO. The full blob for an
+// 8B+ model is >4 GiB (past the `maxStorageBufferRange` descriptor cap) and can't fit one
+// allocation, so it's split into shards sized to the device's real `maxMemoryAllocationSize`; each
+// chunk is read from its shard's pointer. Canonical chunk `off` (32 bytes) == the 4 words
+// [off*4 .. off*4+4]; storing the raw GGUF quant bytes as uvec2[] reproduces
+// `u64::from_le_bytes(chunk[i*8..i*8+8])` exactly on a little-endian GPU.
+layout(std430, buffer_reference, buffer_reference_align = 8) readonly buffer Shard {
+    uvec2 words[];
+};
+
+// Lowest winning batch offset (nonce - start_nonce). Initialised to 0xFFFFFFFF by the host;
+// 0xFFFFFFFF on readback == "no winner in this batch".
+layout(std430, binding = 0) buffer Winner { uint offset; } OUT;
+
+// One GPU device address per weight shard, in shard order — same uvec2(lo, hi) representation.
+layout(std430, binding = 1) readonly buffer ShardAddrs { uvec2 addr[]; } SHARDS;
+
+layout(push_constant) uniform Push {
+    uvec2 p0, p1, p2, p3;   // pre_pow_hash, as 4 LE u64 words
+    uvec2 t0, t1, t2, t3;   // target (256-bit LE), as 4 u64 words
+    uvec2 timestamp;        // header timestamp
+    uvec2 start_nonce;      // first nonce of this batch
+    uint n_chunks;          // total canonical chunks in the weight blob (always < 2^31 — no real
+                             // model has anywhere near that many 32-byte chunks)
+    uint shard_mask;        // chunks_per_shard - 1 (chunks_per_shard is a power of two, <= 2^25)
+    uint k;                 // POM_WALK_STEPS (256)
+    uint batch;             // number of nonces in this dispatch
+    uint shard_shift;       // log2(chunks_per_shard)
+} pc;
+
+// ---- 64-bit emulation over uvec2 (x = low 32 bits, y = high 32 bits) ----
+
+uvec2 xor64(uvec2 a, uvec2 b) {
+    return uvec2(a.x ^ b.x, a.y ^ b.y);
+}
+
+uvec2 add64(uvec2 a, uvec2 b) {
+    uint carry;
+    uint lo = uaddCarry(a.x, b.x, carry);
+    uint hi = a.y + b.y + carry; // uint addition wraps mod 2^32, which is exactly what we want
+    return uvec2(lo, hi);
+}
+
+// Right shift by a compile-time constant 0 < s < 32 — the only shifts mix64 needs (30, 27, 31).
+uvec2 shr64(uvec2 a, uint s) {
+    uint lo = (a.x >> s) | (a.y << (32u - s));
+    uint hi = a.y >> s;
+    return uvec2(lo, hi);
+}
+
+// Wrapping 64x64 -> low-64-bits multiply, built from 32x32->64 partial products. Only the low 32
+// bits of the cross terms can affect the result's bits 32..63 (anything higher is bit >=64, and
+// wrapping multiply discards it anyway), so plain `*` (which truncates mod 2^32 in GLSL) is exact.
+uvec2 mul64(uvec2 a, uvec2 b) {
+    uint hi0, lo0;
+    umulExtended(a.x, b.x, hi0, lo0);
+    uint cross = a.x * b.y + a.y * b.x;
+    return uvec2(lo0, hi0 + cross);
+}
+
+// splitmix64 finalizer — exactly `pom::mix64`. Constants are the same literals split into
+// (lo, hi) 32-bit halves, e.g. 0xbf58476d1ce4e5b9 -> lo=0x1ce4e5b9, hi=0xbf58476d.
+uvec2 mix64(uvec2 x) {
+    x = xor64(x, shr64(x, 30u));
+    x = mul64(x, uvec2(0x1ce4e5b9u, 0xbf58476du));
+    x = xor64(x, shr64(x, 27u));
+    x = mul64(x, uvec2(0x133111ebu, 0x94d049bbu));
+    x = xor64(x, shr64(x, 31u));
+    return x;
+}
+
+// 64-bit dividend % 32-bit divisor -> 32-bit remainder, via binary long division (MSB to LSB).
+// Requires divisor < 2^31 so `rem` (always < divisor) never overflows on the `rem << 1` step —
+// true for n_chunks in any realistic model (2^31 32-byte chunks would be a ~64 GiB weight blob).
+uint mod64(uvec2 dividend, uint divisor) {
+    uint rem = 0u;
+    for (int i = 31; i >= 0; --i) {
+        rem = (rem << 1) | ((dividend.y >> uint(i)) & 1u);
+        if (rem >= divisor) rem -= divisor;
+    }
+    for (int i = 31; i >= 0; --i) {
+        rem = (rem << 1) | ((dividend.x >> uint(i)) & 1u);
+        if (rem >= divisor) rem -= divisor;
+    }
+    return rem;
+}
+
+bool lt64(uvec2 a, uvec2 b) {
+    return a.y != b.y ? a.y < b.y : a.x < b.x;
+}
+
+bool eq64(uvec2 a, uvec2 b) {
+    return a.x == b.x && a.y == b.y;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.batch) {
+        return;
+    }
+    uvec2 nonce = add64(pc.start_nonce, uvec2(idx, 0u));
+
+    // pom_block_seed: mix64-fold of (nonce, timestamp, pre_pow_hash words).
+    uvec2 state = mix64(xor64(nonce, uvec2(0x27978531u, 0x0004B657u))); // 0x4B65727978531
+    state = mix64(xor64(state, pc.timestamp));
+    state = mix64(xor64(state, pc.p0));
+    state = mix64(xor64(state, pc.p1));
+    state = mix64(xor64(state, pc.p2));
+    state = mix64(xor64(state, pc.p3));
+
+    // walk_final: K data-dependent reads. off = state % n_chunks; fold the chunk; repeat.
+    // `off` is always < n_chunks < 2^31, so it fits in a plain 32-bit uint for its whole lifetime —
+    // only the pointer arithmetic to reach it needs 64-bit (emulated) addresses.
+    uint off = mod64(state, pc.n_chunks);
+    for (uint i = 0u; i < pc.k; ++i) {
+        uint shard = off >> pc.shard_shift;
+        uint local = off & pc.shard_mask;
+        uvec2 base = SHARDS.addr[shard];
+        uint carry;
+        uint lo = uaddCarry(base.x, local * 32u, carry); // 32 bytes per canonical chunk
+        uint hi = base.y + carry;
+        Shard chunk = Shard(uvec2(lo, hi));
+        uvec2 h = state;
+        h = xor64(h, chunk.words[0]);
+        h = xor64(h, chunk.words[1]);
+        h = xor64(h, chunk.words[2]);
+        h = xor64(h, chunk.words[3]);
+        state = mix64(h);
+        off = mod64(state, pc.n_chunks);
+    }
+
+    // pom_pow_value: 4 keyed mix64 folds → 256-bit LE value as words o0..o3 (o0 = bytes 0..8).
+    uvec2 o0 = mix64(xor64(xor64(state, pc.p0), uvec2(0x7F4A7C15u, 0x9E3779B9u))); // 0x9E3779B97F4A7C15
+    uvec2 o1 = mix64(xor64(xor64(o0, pc.p1), uvec2(0x27D4EB4Fu, 0xC2B2AE3Du)));    // 0xC2B2AE3D27D4EB4F
+    uvec2 o2 = mix64(xor64(xor64(o1, pc.p2), uvec2(0x9E3779F9u, 0x165667B1u)));    // 0x165667B19E3779F9
+    uvec2 o3 = mix64(xor64(xor64(o2, pc.p3), uvec2(0x6659FD93u, 0xD6E8FEB8u)));    // 0xD6E8FEB86659FD93
+
+    // le_leq(pow, target): unsigned 256-bit LE compare, most-significant word (o3) first.
+    bool le;
+    if (!eq64(o3, pc.t3)) { le = lt64(o3, pc.t3); }
+    else if (!eq64(o2, pc.t2)) { le = lt64(o2, pc.t2); }
+    else if (!eq64(o1, pc.t1)) { le = lt64(o1, pc.t1); }
+    else if (!eq64(o0, pc.t0)) { le = lt64(o0, pc.t0); }
+    else { le = true; }
+
+    if (le) {
+        atomicMin(OUT.offset, idx);
+    }
+}

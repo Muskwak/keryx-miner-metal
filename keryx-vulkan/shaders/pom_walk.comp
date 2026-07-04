@@ -6,6 +6,11 @@
 // One invocation == one nonce. Each invocation re-derives the block seed, walks K data-dependent
 // 32-byte chunks of the resident weight blob, folds to a 256-bit pow value, and — if it is <= the
 // target — records its batch offset via atomicMin so the host recovers the LOWEST winning nonce.
+//
+// NATIVE uint64_t variant — requires `shaderInt64`. Used when the device supports it (all AMD/
+// NVIDIA desktop GPUs, and some mobile GPUs). Devices lacking it (e.g. Qualcomm Adreno, which does
+// not implement `shaderInt64` despite otherwise-modern Vulkan 1.3 support) use `pom_walk_i32.comp`
+// instead — see `keryx-vulkan/src/pom_walk.rs` for the runtime feature-detect + pick.
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_buffer_reference : require
 
