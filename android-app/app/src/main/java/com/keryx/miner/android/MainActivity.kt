@@ -56,6 +56,7 @@ fun MinerScreen() {
     var address by remember { mutableStateOf("stratum+tcp://127.0.0.1:22110") }
     var miningAddress by remember { mutableStateOf("") }
     var isMining by remember { mutableStateOf(false) }
+    var hashrateMhs by remember { mutableStateOf(0.0) }
     var logLines by remember { mutableStateOf(listOf("keryx-miner Android — ready")) }
     val scope = rememberCoroutineScope()
     val scrollState = rememberScrollState()
@@ -69,6 +70,7 @@ fun MinerScreen() {
             runCatching {
                 val obj = JSONObject(json)
                 isMining = obj.getBoolean("running")
+                hashrateMhs = obj.optDouble("hashrate_mhs", 0.0)
                 val lines = obj.getJSONArray("log_lines")
                 val parsed = (0 until lines.length()).map { lines.getString(it) }
                 val nonces = obj.optLong("nonces_found", 0)
@@ -145,6 +147,13 @@ fun MinerScreen() {
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text(if (isMining) "Stop Mining" else "Start Mining")
+        }
+
+        if (isMining) {
+            Text(
+                "Hashrate: %.4f MH/s".format(hashrateMhs),
+                style = MaterialTheme.typography.bodyMedium,
+            )
         }
 
         Column(

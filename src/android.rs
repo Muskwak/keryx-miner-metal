@@ -44,9 +44,15 @@ static STOP_TX: OnceLock<watch::Sender<bool>> = OnceLock::new();
 /// succeeded, so we log it once and don't re-attempt on every template.
 static INSTALLED_OK: AtomicBool = AtomicBool::new(false);
 static BATCH_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Most recent batch's MH/s, as `f64::to_bits` (no atomic f64 in std) — exposed in `status_impl`'s
+/// JSON so the UI can show a live number instead of scanning log text for the heartbeat line.
+static LAST_HASHRATE_MHS_BITS: AtomicU64 = AtomicU64::new(0);
 
 const BATCH_SIZE: u64 = 1 << 20;
-const HEARTBEAT_BATCHES: u64 = 16;
+// 1, not 16: mobile GPU throughput (especially the shaderInt64-emulated Vulkan path on Adreno) can
+// be far below desktop-class rates, so a 16-batch heartbeat interval could take minutes to produce
+// its first hashrate log line — looking like mining had silently stalled. Report every batch.
+const HEARTBEAT_BATCHES: u64 = 1;
 
 /// Same mechanism as the desktop CLI's `--devfund-percent` and iOS's fixed 2% floor.
 const DEVFUND_ADDRESS: &str = "keryx:qpcptntu45n0xtyq60apnwnhpkta0ujzt5sy3uk5v6nrjvxlqhamjyc882jj3";
@@ -718,6 +724,7 @@ fn mining_worker(
         if batches % HEARTBEAT_BATCHES == 0 {
             let secs = t0.elapsed().as_secs_f64().max(1e-6);
             let mhs = (BATCH_SIZE as f64 / secs) / 1e6;
+            LAST_HASHRATE_MHS_BITS.store(mhs.to_bits(), Ordering::Relaxed);
             log_msg(&format!("android: mining… {batches} batches, {mhs:.2} MH/s"));
         }
 
@@ -754,14 +761,16 @@ fn stop_impl() {
 fn status_impl() -> String {
     let running = RUNNING.load(Ordering::Relaxed);
     let nonces = NONCES_FOUND.load(Ordering::Relaxed);
+    let hashrate_mhs = f64::from_bits(LAST_HASHRATE_MHS_BITS.load(Ordering::Relaxed));
     let log = LAST_LOG.get_or_init(|| Mutex::new(String::new()));
     let log_content = log.lock().ok().map(|l| l.clone()).unwrap_or_default();
     let last_lines: Vec<&str> = log_content.lines().rev().take(20).collect();
     let last_lines: Vec<&str> = last_lines.into_iter().rev().collect();
     format!(
-        r#"{{"running":{},"nonces_found":{},"log_lines":[{}]}}"#,
+        r#"{{"running":{},"nonces_found":{},"hashrate_mhs":{:.4},"log_lines":[{}]}}"#,
         running,
         nonces,
+        hashrate_mhs,
         last_lines
             .iter()
             .map(|l| format!("\"{}\"", l.replace('\\', "\\\\").replace('"', "\\\"")))

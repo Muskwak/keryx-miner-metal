@@ -29,6 +29,7 @@ struct ContentView: View {
     @State private var grpcAddress: String = "127.0.0.1:22110"
     @State private var miningAddress: String = ""
     @State private var isMining: Bool = false
+    @State private var hashrateMhs: Double = 0.0
     @State private var logLines: [String] = ["keryx-miner iOS — ready"]
     @State private var statusTimer: Timer?
 
@@ -76,6 +77,12 @@ struct ContentView: View {
                     .cornerRadius(10)
                 }
                 .padding(.horizontal)
+
+                if isMining {
+                    Text(String(format: "Hashrate: %.4f MH/s", hashrateMhs))
+                        .font(.callout)
+                        .padding(.horizontal)
+                }
 
                 // Log output
                 VStack(alignment: .leading, spacing: 2) {
@@ -156,6 +163,7 @@ struct ContentView: View {
            let nonces = obj["nonces_found"] as? UInt64,
            let lines = obj["log_lines"] as? [String] {
             isMining = running
+            hashrateMhs = obj["hashrate_mhs"] as? Double ?? 0.0
             logLines = Array(lines.suffix(20))
             if nonces > 0 {
                 logLines.append("Nonces found: \(nonces)")
