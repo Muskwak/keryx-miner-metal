@@ -45,13 +45,14 @@ struct PomPush {
 }
 
 /// Emulated push-constant block — layout MUST match the `Push` block in `pom_walk_i32.comp`.
-/// Every field that's a genuine arbitrary 64-bit value (hash/target words, timestamp, nonce) is a
-/// `[u32; 2]` (lo, hi) pair; `n_chunks`/`shard_mask` fit in `u32` for any realistic model (see the
-/// shader's `mod64` comment) and stay plain `u32`, same as `k`/`batch`/`shard_shift`. All ten pair
-/// fields are declared first (each naturally 8-byte-aligned when packed from offset 0) followed by
-/// the five plain `u32` fields, so this repr(C) layout matches GLSL's std430 push-constant layout
-/// byte-for-byte without needing an explicit `#[repr(align(8))]` wrapper — see the compile-time
-/// size assertion below, which would catch any future reordering that broke this.
+/// Every field that's a genuine arbitrary 64-bit value (hash/target words, timestamp, nonce, the
+/// Barrett reciprocal `mu`) is a `[u32; 2]` (lo, hi) pair; `n_chunks`/`shard_mask` fit in `u32` for
+/// any realistic model (see the shader's `mod64_fast` comment) and stay plain `u32`, same as
+/// `k`/`batch`/`shard_shift`. All eleven pair fields are declared first (each naturally
+/// 8-byte-aligned when packed from offset 0) followed by the five plain `u32` fields, so this
+/// repr(C) layout matches GLSL's std430 push-constant layout byte-for-byte without needing an
+/// explicit `#[repr(align(8))]` wrapper — see the compile-time size assertion below, which would
+/// catch any future reordering that broke this.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PomPush32 {
@@ -59,6 +60,7 @@ struct PomPush32 {
     t: [[u32; 2]; 4],
     timestamp: [u32; 2],
     start_nonce: [u32; 2],
+    mu: [u32; 2], // Barrett reciprocal floor(2^64 / n_chunks) — see mod64_fast in the shader
     n_chunks: u32,
     shard_mask: u32,
     k: u32,
@@ -66,10 +68,18 @@ struct PomPush32 {
     shard_shift: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<PomPush32>() == 100);
+const _: () = assert!(std::mem::size_of::<PomPush32>() == 108);
 
 fn split_u64(v: u64) -> [u32; 2] {
     [(v & 0xFFFF_FFFF) as u32, (v >> 32) as u32]
+}
+
+/// Barrett reciprocal for `pom_walk_i32.comp`'s `mod64_fast`: `floor(2^64 / divisor)`. Computed
+/// once per `PomWalkGpu` (n_chunks is fixed for its lifetime), not per nonce or per batch. Requires
+/// divisor >= 2 — checked by the caller ([`PomWalkGpu::new_sharded`]).
+fn compute_barrett_mu(divisor: u64) -> [u32; 2] {
+    debug_assert!(divisor >= 2);
+    split_u64(((1u128 << 64) / (divisor as u128)) as u64)
 }
 
 const NO_WINNER: u32 = 0xFFFF_FFFF;
@@ -84,7 +94,7 @@ const SHARD_CHUNKS: u64 = 1 << 25;
 /// 65,536 keeps each dispatch to a few ms on device-local VRAM while staying far above launch cost.
 const MAX_DISPATCH_NONCES: u32 = 1 << 16;
 
-/// `mod64`'s binary long division (in `pom_walk_i32.comp`) assumes the divisor (`n_chunks`) is
+/// `mod64_fast`'s Barrett reduction (in `pom_walk_i32.comp`) assumes the divisor (`n_chunks`) is
 /// strictly less than 2^31 — see that shader's comment. 2^31 32-byte chunks would be a ~64 GiB
 /// weight blob, far beyond anything this miner ever loads, but the guard is here so a future
 /// pathological input fails loudly instead of silently mis-mining.
@@ -100,7 +110,8 @@ pub struct PomWalkGpu {
     winner: GpuBuffer,
     n_chunks: u64,
     shard_chunks: u64,
-    use_i32: bool, // true: shaderInt64-less emulated variant; false: native uint64_t variant
+    use_i32: bool,   // true: shaderInt64-less emulated variant; false: native uint64_t variant
+    i32_mu: [u32; 2], // Barrett reciprocal for n_chunks; unused (zeroed) unless use_i32
 }
 
 impl PomWalkGpu {
@@ -128,9 +139,16 @@ impl PomWalkGpu {
         let use_i32 = !vk.supports_shader_int64();
         if use_i32 && n_chunks >= MAX_N_CHUNKS_FOR_I32_MOD {
             return Err(format!(
-                "n_chunks={n_chunks} exceeds the shaderInt64-less shader's mod64 limit ({MAX_N_CHUNKS_FOR_I32_MOD})"
+                "n_chunks={n_chunks} exceeds the shaderInt64-less shader's mod64_fast limit ({MAX_N_CHUNKS_FOR_I32_MOD})"
             ));
         }
+        // mod64_fast's Barrett reduction requires divisor (n_chunks) >= 2 — n_chunks == 0 is
+        // already rejected above, and n_chunks == 1 is a nonsensical single-chunk "model" that
+        // never occurs in practice, but guard it explicitly rather than silently mis-dividing.
+        if use_i32 && n_chunks < 2 {
+            return Err(format!("n_chunks={n_chunks} is too small for the shaderInt64-less shader's mod64_fast"));
+        }
+        let i32_mu = if use_i32 { compute_barrett_mu(n_chunks) } else { [0, 0] };
         let (spv_bytes, push_size) = if use_i32 {
             (POM_WALK_I32_SPV, std::mem::size_of::<PomPush32>() as u32)
         } else {
@@ -161,7 +179,7 @@ impl PomWalkGpu {
         vk.write_buffer(&addr_table, words_as_bytes(&addrs));
         let winner = vk.create_buffer(4)?;
 
-        Ok(Self { vk, kernel, shards, addr_table, winner, n_chunks, shard_chunks, use_i32 })
+        Ok(Self { vk, kernel, shards, addr_table, winner, n_chunks, shard_chunks, use_i32, i32_mu })
     }
 
     /// Name of the GPU the miner is running on.
@@ -197,6 +215,7 @@ impl PomWalkGpu {
                     t: [split_u64(t[0]), split_u64(t[1]), split_u64(t[2]), split_u64(t[3])],
                     timestamp: split_u64(timestamp),
                     start_nonce: split_u64(start_nonce),
+                    mu: self.i32_mu,
                     n_chunks: self.n_chunks as u32,
                     shard_mask: shard_mask as u32,
                     k: POM_WALK_STEPS,

@@ -17,6 +17,13 @@
 // `bufferDeviceAddress` (via `GL_EXT_buffer_reference`) is a SEPARATE, supported feature —
 // `GL_EXT_buffer_reference_uvec2` lets a reference be constructed from a `uvec2` instead of a
 // `uint64_t`, which is the one thing that would otherwise require Int64.
+//
+// The `% n_chunks` modulo (257 calls per nonce — once up front, once per walk step) uses Barrett
+// reduction (`mod64_fast`/`mulhi64`), not a bit-serial division loop: n_chunks is fixed for a given
+// PomWalkGpu, so the host precomputes a reciprocal (`mu`) once and every invocation just does a
+// handful of wide multiplies instead of 64 serial shift-and-subtract steps. This was the dominant
+// per-nonce cost on real hardware (a first, simpler bit-serial version measured ~0.06 MH/s on a
+// Samsung S23 Ultra / Adreno 740).
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference_uvec2 : require
 
@@ -45,6 +52,8 @@ layout(push_constant) uniform Push {
     uvec2 t0, t1, t2, t3;   // target (256-bit LE), as 4 u64 words
     uvec2 timestamp;        // header timestamp
     uvec2 start_nonce;      // first nonce of this batch
+    uvec2 mu;               // Barrett reciprocal floor(2^64 / n_chunks), host-precomputed once
+                             // per PomWalkGpu (n_chunks is fixed for its lifetime) — see mod64_fast.
     uint n_chunks;          // total canonical chunks in the weight blob (always < 2^31 — no real
                              // model has anywhere near that many 32-byte chunks)
     uint shard_mask;        // chunks_per_shard - 1 (chunks_per_shard is a power of two, <= 2^25)
@@ -94,20 +103,72 @@ uvec2 mix64(uvec2 x) {
     return x;
 }
 
-// 64-bit dividend % 32-bit divisor -> 32-bit remainder, via binary long division (MSB to LSB).
-// Requires divisor < 2^31 so `rem` (always < divisor) never overflows on the `rem << 1` step —
-// true for n_chunks in any realistic model (2^31 32-byte chunks would be a ~64 GiB weight blob).
-uint mod64(uvec2 dividend, uint divisor) {
-    uint rem = 0u;
-    for (int i = 31; i >= 0; --i) {
-        rem = (rem << 1) | ((dividend.y >> uint(i)) & 1u);
-        if (rem >= divisor) rem -= divisor;
+uvec2 sub64(uvec2 a, uvec2 b) {
+    uint borrow;
+    uint lo = usubBorrow(a.x, b.x, borrow);
+    uint hi = a.y - b.y - borrow; // wraps mod 2^32; only ever used where a >= b
+    return uvec2(lo, hi);
+}
+
+bool wide_ge_u32(uvec2 v, uint d) {
+    return v.y != 0u || v.x >= d;
+}
+
+uvec2 sub64_u32(uvec2 v, uint d) {
+    return sub64(v, uvec2(d, 0u));
+}
+
+// The HIGH 64 bits of the full 128-bit product a*b, built from four 32x32->64 partial products
+// (umulExtended) summed with explicit carry propagation across the three overlapping 32-bit
+// columns. Used only by mod64_fast's Barrett reduction below.
+uvec2 mulhi64(uvec2 a, uvec2 b) {
+    uint p0_hi, p0_lo;
+    umulExtended(a.x, b.x, p0_hi, p0_lo); // a.lo * b.lo
+    uint p1_hi, p1_lo;
+    umulExtended(a.x, b.y, p1_hi, p1_lo); // a.lo * b.hi
+    uint p2_hi, p2_lo;
+    umulExtended(a.y, b.x, p2_hi, p2_lo); // a.hi * b.lo
+    uint p3_hi, p3_lo;
+    umulExtended(a.y, b.y, p3_hi, p3_lo); // a.hi * b.hi
+
+    // bits[32,64) column: p0_hi + p1_lo + p2_lo, carrying into bits[64,96). The column's own sum
+    // (bits 32..64 of the full product) is discarded — we only need bits [64,128).
+    uint c1, c2;
+    uint col_lo = uaddCarry(p0_hi, p1_lo, c1);
+    uaddCarry(col_lo, p2_lo, c2);
+    uint carry_to_hi = c1 + c2; // 0, 1, or 2
+
+    // bits[64,96) column: p1_hi + p2_hi + p3_lo + carry_to_hi, carrying into bits[96,128).
+    uint c3, c4, c5;
+    uint mid_hi = uaddCarry(p1_hi, p2_hi, c3);
+    mid_hi = uaddCarry(mid_hi, p3_lo, c4);
+    mid_hi = uaddCarry(mid_hi, carry_to_hi, c5);
+    uint carry_to_top = c3 + c4 + c5; // 0..=3
+
+    // bits[96,128) column: p3_hi + carry_to_top (wraps mod 2^32 — bits beyond 128 don't exist).
+    uint top = p3_hi + carry_to_top;
+
+    return uvec2(mid_hi, top);
+}
+
+// Barrett-reduction-based dividend % divisor, replacing a 64-iteration bit-serial division with a
+// handful of wide multiplies: `mu` = floor(2^64 / divisor), precomputed ONCE on the host per
+// PomWalkGpu (n_chunks is fixed for its lifetime) since it doesn't depend on the dividend. The
+// approximate quotient `mulhi64(dividend, mu)` undershoots the true quotient by only a small,
+// bounded amount, so a handful of corrective subtractions land on the exact remainder — proven
+// bit-exact against native u64 `%` across exhaustive + randomized inputs in
+// keryx-vulkan/tests/i32_emulation_bitexact.rs (divisor swept exhaustively over 2..=2000, plus the
+// realistic/edge divisor set up to just under the 2^31 guard). Requires divisor >= 2 (mu would
+// overflow 64 bits for divisor == 1, which never occurs for a real model's chunk count).
+uint mod64_fast(uvec2 dividend, uint divisor, uvec2 mu) {
+    uvec2 q1 = mulhi64(dividend, mu);
+    uvec2 r = sub64(dividend, mul64(q1, uvec2(divisor, 0u)));
+    for (int c = 0; c < 4; ++c) {
+        if (wide_ge_u32(r, divisor)) {
+            r = sub64_u32(r, divisor);
+        }
     }
-    for (int i = 31; i >= 0; --i) {
-        rem = (rem << 1) | ((dividend.x >> uint(i)) & 1u);
-        if (rem >= divisor) rem -= divisor;
-    }
-    return rem;
+    return r.x;
 }
 
 bool lt64(uvec2 a, uvec2 b) {
@@ -136,7 +197,7 @@ void main() {
     // walk_final: K data-dependent reads. off = state % n_chunks; fold the chunk; repeat.
     // `off` is always < n_chunks < 2^31, so it fits in a plain 32-bit uint for its whole lifetime —
     // only the pointer arithmetic to reach it needs 64-bit (emulated) addresses.
-    uint off = mod64(state, pc.n_chunks);
+    uint off = mod64_fast(state, pc.n_chunks, pc.mu);
     for (uint i = 0u; i < pc.k; ++i) {
         uint shard = off >> pc.shard_shift;
         uint local = off & pc.shard_mask;
@@ -151,7 +212,7 @@ void main() {
         h = xor64(h, chunk.words[2]);
         h = xor64(h, chunk.words[3]);
         state = mix64(h);
-        off = mod64(state, pc.n_chunks);
+        off = mod64_fast(state, pc.n_chunks, pc.mu);
     }
 
     // pom_pow_value: 4 keyed mix64 folds → 256-bit LE value as words o0..o3 (o0 = bytes 0..8).

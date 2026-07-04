@@ -78,6 +78,71 @@ fn mod64_emu(dividend: U64Emu, divisor: u32) -> u32 {
     rem
 }
 
+fn sub64(a: U64Emu, b: U64Emu) -> U64Emu {
+    let (lo, borrow) = a.0.overflowing_sub(b.0);
+    let hi = a.1.wrapping_sub(b.1).wrapping_sub(borrow as u32);
+    (lo, hi)
+}
+
+fn wide_ge_u32(v: U64Emu, d: u32) -> bool {
+    v.1 != 0 || v.0 >= d
+}
+
+fn sub64_u32(v: U64Emu, d: u32) -> U64Emu {
+    sub64(v, (d, 0))
+}
+
+/// Mirrors `mulhi64` in the shader: the HIGH 64 bits of the full 128-bit product of two uvec2
+/// operands, built from four 32x32->64 partial products (`umulExtended`) summed with explicit
+/// carry propagation across the three overlapping 32-bit columns.
+fn mulhi64(a: U64Emu, b: U64Emu) -> U64Emu {
+    let p0 = (a.0 as u64) * (b.0 as u64); // a.lo * b.lo
+    let p1 = (a.0 as u64) * (b.1 as u64); // a.lo * b.hi
+    let p2 = (a.1 as u64) * (b.0 as u64); // a.hi * b.lo
+    let p3 = (a.1 as u64) * (b.1 as u64); // a.hi * b.hi
+
+    let (p0_hi, _p0_lo) = ((p0 >> 32) as u32, p0 as u32);
+    let (p1_hi, p1_lo) = ((p1 >> 32) as u32, p1 as u32);
+    let (p2_hi, p2_lo) = ((p2 >> 32) as u32, p2 as u32);
+    let (p3_hi, p3_lo) = ((p3 >> 32) as u32, p3 as u32);
+
+    // bits[32,64) column: p0_hi + p1_lo + p2_lo, carrying into bits[64,96). The column's own sum
+    // (bits 32..64 of the full product) is discarded — mulhi64 only returns bits [64,128).
+    let (col_lo, c1) = p0_hi.overflowing_add(p1_lo);
+    let (_col_lo, c2) = col_lo.overflowing_add(p2_lo);
+    let carry_to_hi = c1 as u32 + c2 as u32; // 0, 1, or 2
+
+    // bits[64,96) column: p1_hi + p2_hi + p3_lo + carry_to_hi, carrying into bits[96,128).
+    let (mid_hi, c3) = p1_hi.overflowing_add(p2_hi);
+    let (mid_hi, c4) = mid_hi.overflowing_add(p3_lo);
+    let (mid_hi, c5) = mid_hi.overflowing_add(carry_to_hi);
+    let carry_to_top = c3 as u32 + c4 as u32 + c5 as u32; // 0..=3
+
+    // bits[96,128) column: p3_hi + carry_to_top (wraps mod 2^32 — bits beyond 128 don't exist).
+    let top = p3_hi.wrapping_add(carry_to_top);
+
+    (mid_hi, top) // bits[64,96) then bits[96,128) — matches (lo, hi) convention for the top half
+}
+
+/// Barrett-reduction-based `dividend % divisor`, replacing the 64-iteration bit-serial `mod64`
+/// with a handful of wide multiplies. `mu` is precomputed once (host-side, per n_chunks) as
+/// `floor(2^64 / divisor)`. Requires divisor >= 2 (mu would overflow 64 bits for divisor == 1,
+/// which never occurs for a real model's chunk count anyway).
+fn mod64_fast(dividend: U64Emu, divisor: u32, mu: U64Emu) -> u32 {
+    assert!(divisor >= 2);
+    let q1 = mulhi64(dividend, mu); // approx quotient, off by at most a small constant
+    let mut r = sub64(dividend, mul64(q1, (divisor, 0)));
+    // Barrett's bound guarantees a small, fixed number of corrections suffice; 4 is a generous
+    // margin over the theoretical ~2, verified empirically by the exhaustive tests below.
+    for _ in 0..4 {
+        if wide_ge_u32(r, divisor) {
+            r = sub64_u32(r, divisor);
+        }
+    }
+    assert_eq!(r.1, 0, "mod64_fast: correction loop did not converge for divisor={divisor}");
+    r.0
+}
+
 fn mix64_native(mut x: u64) -> u64 {
     x ^= x >> 30;
     x = x.wrapping_mul(0xbf58476d1ce4e5b9);
@@ -215,6 +280,68 @@ fn mod64_bit_exact() {
     }
 }
 
+/// Host-side precomputation: `mu = floor(2^64 / divisor)`, exactly what `pom_walk.rs` computes
+/// once per `PomWalkGpu` (n_chunks is fixed for the miner's lifetime) via `u128` arithmetic.
+fn compute_mu(divisor: u32) -> U64Emu {
+    to_emu(((1u128 << 64) / (divisor as u128)) as u64)
+}
+
+#[test]
+fn mulhi64_bit_exact() {
+    let mut rng = Rng(8);
+    for _ in 0..200_000 {
+        let (a, b) = (rng.next(), rng.next());
+        let expected = (((a as u128) * (b as u128)) >> 64) as u64;
+        let got = from_emu(mulhi64(to_emu(a), to_emu(b)));
+        assert_eq!(got, expected, "mulhi64({a:#x}, {b:#x})");
+    }
+    for &a in EDGE_U64 {
+        for &b in EDGE_U64 {
+            let expected = (((a as u128) * (b as u128)) >> 64) as u64;
+            let got = from_emu(mulhi64(to_emu(a), to_emu(b)));
+            assert_eq!(got, expected, "mulhi64({a:#x}, {b:#x})");
+        }
+    }
+}
+
+#[test]
+fn mod64_fast_bit_exact() {
+    let mut rng = Rng(9);
+    // Divisors spanning realistic model chunk counts up to just under the 2^31 shader guard —
+    // mirrors mod64_bit_exact's list, minus 1 (mod64_fast requires divisor >= 2).
+    let divisors: &[u32] = &[2, 3, 7, 255, 1 << 16, 34_420_544, (1u32 << 31) - 1, (1u32 << 30) + 1];
+    for &d in divisors {
+        let mu = compute_mu(d);
+        for &dv in EDGE_U64 {
+            let expected = dv % (d as u64);
+            let got = mod64_fast(to_emu(dv), d, mu) as u64;
+            assert_eq!(got, expected, "mod64_fast({dv:#x} % {d})");
+        }
+        for &dv in &[(d as u64).saturating_sub(1), d as u64, d as u64 + 1] {
+            let expected = dv % (d as u64);
+            let got = mod64_fast(to_emu(dv), d, mu) as u64;
+            assert_eq!(got, expected, "mod64_fast({dv:#x} % {d})");
+        }
+        for _ in 0..50_000 {
+            let dv = rng.next();
+            let expected = dv % (d as u64);
+            let got = mod64_fast(to_emu(dv), d, mu) as u64;
+            assert_eq!(got, expected, "mod64_fast({dv:#x} % {d})");
+        }
+    }
+    // Exhaustive sweep over every divisor 2..=2000 with randomized dividends — catches any
+    // divisor-dependent edge case the hand-picked list above might miss.
+    for d in 2u32..=2000 {
+        let mu = compute_mu(d);
+        for _ in 0..200 {
+            let dv = rng.next();
+            let expected = dv % (d as u64);
+            let got = mod64_fast(to_emu(dv), d, mu) as u64;
+            assert_eq!(got, expected, "mod64_fast({dv:#x} % {d})");
+        }
+    }
+}
+
 fn words4(b: &[u8; 32]) -> [u64; 4] {
     let mut w = [0u64; 4];
     for (i, wi) in w.iter_mut().enumerate() {
@@ -296,6 +423,7 @@ fn walk_emu(
     let p = words4(pre_pow_hash).map(to_emu);
     let t = words4(target).map(to_emu);
     let n_chunks32 = n_chunks as u32;
+    let mu = compute_mu(n_chunks32); // host precomputes this once per PomWalkGpu, not per nonce
 
     let mut state = mix64_emu(xor64(to_emu(nonce), (0x27978531u32, 0x0004B657u32)));
     state = mix64_emu(xor64(state, to_emu(timestamp)));
@@ -304,7 +432,7 @@ fn walk_emu(
     state = mix64_emu(xor64(state, p[2]));
     state = mix64_emu(xor64(state, p[3]));
 
-    let mut off = mod64_emu(state, n_chunks32) as u64;
+    let mut off = mod64_fast(state, n_chunks32, mu) as u64;
     for _ in 0..k {
         let chunk = chunk_of(off).map(to_emu);
         let mut h = state;
@@ -312,7 +440,7 @@ fn walk_emu(
             h = xor64(h, w);
         }
         state = mix64_emu(h);
-        off = mod64_emu(state, n_chunks32) as u64;
+        off = mod64_fast(state, n_chunks32, mu) as u64;
     }
 
     let o0 = mix64_emu(xor64(xor64(state, p[0]), (0x7F4A7C15u32, 0x9E3779B9u32)));
